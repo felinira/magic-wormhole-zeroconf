@@ -1,5 +1,4 @@
 use crate::network;
-use once_cell::sync::Lazy;
 use std::any::Any;
 use std::sync::Arc;
 use std::thread::Thread;
@@ -10,7 +9,7 @@ use zeroconf::{
     MdnsBrowser, MdnsService, ServiceDiscovery, ServiceRegistration, ServiceType, TxtRecord,
 };
 
-static SERVICE_UUID: Lazy<uuid::Uuid> = Lazy::new(uuid::Uuid::new_v4);
+const SERVICE_NAME: &'static str = "app-drey-Warp-zeroconf-v0";
 
 #[derive(Debug)]
 pub(crate) enum ZeroconfEvent {
@@ -29,7 +28,7 @@ pub(crate) struct ZeroconfService {
 }
 
 impl ZeroconfService {
-    pub fn run(mailbox_port: u16) -> Self {
+    pub fn run(control_port: u16, service_uuid: uuid::Uuid) -> Self {
         println!("Running service");
 
         let (sender, receiver) = async_channel::unbounded();
@@ -37,14 +36,14 @@ impl ZeroconfService {
         let thread = std::thread::spawn(move || {
             let port = network::get_random_port();
             let mut service =
-                MdnsService::new(ServiceType::new("magic-wormhole", "tcp").unwrap(), port);
+                MdnsService::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap(), port);
             let mut txt_record = TxtRecord::new();
 
             txt_record
-                .insert("uuid", &SERVICE_UUID.to_string())
+                .insert("uuid", &service_uuid.to_string())
                 .unwrap();
             txt_record
-                .insert("mailbox-port", &mailbox_port.to_string())
+                .insert("control-port", &control_port.to_string())
                 .unwrap();
 
             service.set_registered_callback(Box::new(Self::on_service_registered));
@@ -101,7 +100,7 @@ impl ZeroconfBrowser {
         let (sender, receiver) = async_channel::unbounded();
 
         let thread = std::thread::spawn(|| {
-            let mut browser = MdnsBrowser::new(ServiceType::new("magic-wormhole", "tcp").unwrap());
+            let mut browser = MdnsBrowser::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap());
             browser.set_service_discovered_callback(Box::new(Self::on_service_discovered));
             browser.set_context(Box::new(sender));
             let event_loop = browser.browse_services().unwrap();
@@ -128,7 +127,7 @@ impl ZeroconfBrowser {
 
         match result {
             Ok(service) => {
-                if service.service_type().name() != "magic-wormhole" {
+                if service.service_type().name() != SERVICE_NAME {
                     return;
                 }
 
@@ -140,12 +139,12 @@ impl ZeroconfBrowser {
                 if !txt.contains_key("uuid") {
                     return;
                 }
-
-                if txt.get("uuid") == Some(SERVICE_UUID.to_string()) {
+/*
+                if txt.get("uuid") == Some(self.uuid.to_string()) {
                     println!("Discovered myself");
                     return;
                 }
-
+*/
                 println!("Service discovered: {:?}", service);
                 sender
                     .send_blocking(ZeroconfEvent::ServiceDiscovered(service))
