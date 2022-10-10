@@ -28,22 +28,21 @@ pub(crate) struct ZeroconfService {
 }
 
 impl ZeroconfService {
-    pub fn run(control_port: u16, service_uuid: uuid::Uuid) -> Self {
+    pub fn run(mailbox_port: u16, control_port: u16, service_uuid: uuid::Uuid) -> Self {
         println!("Running service");
 
         let (sender, receiver) = async_channel::unbounded();
 
         let thread = std::thread::spawn(move || {
-            let port = network::get_random_port();
             let mut service =
-                MdnsService::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap(), port);
+                MdnsService::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap(), control_port);
             let mut txt_record = TxtRecord::new();
 
             txt_record
                 .insert("uuid", &service_uuid.to_string())
                 .unwrap();
             txt_record
-                .insert("control-port", &control_port.to_string())
+                .insert("mailbox-port", &control_port.to_string())
                 .unwrap();
 
             service.set_registered_callback(Box::new(Self::on_service_registered));
@@ -139,12 +138,12 @@ impl ZeroconfBrowser {
                 if !txt.contains_key("uuid") {
                     return;
                 }
-/*
-                if txt.get("uuid") == Some(self.uuid.to_string()) {
-                    println!("Discovered myself");
-                    return;
-                }
-*/
+                /*
+                                if txt.get("uuid") == Some(self.uuid.to_string()) {
+                                    println!("Discovered myself");
+                                    return;
+                                }
+                */
                 println!("Service discovered: {:?}", service);
                 sender
                     .send_blocking(ZeroconfEvent::ServiceDiscovered(service))

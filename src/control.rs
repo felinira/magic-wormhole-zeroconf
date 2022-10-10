@@ -1,17 +1,17 @@
 //! Control socket used for initial connection and wormhole establishment
 
+use async_std::net::TcpStream;
+use async_tungstenite::{tungstenite, WebSocketStream};
+use futures::stream::FusedStream;
+use futures::{SinkExt, StreamExt};
+use parking_lot::RwLock;
+use serde_derive::{Deserialize, Serialize};
+use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use parking_lot::RwLock;
-use async_std::net::TcpStream;
-use serde_derive::{Serialize, Deserialize};
-use serde_json;
-use async_tungstenite::{tungstenite, WebSocketStream};
-use futures::stream::FusedStream;
-use futures::{SinkExt, StreamExt};
 
 const APP_ID: &'static str = "app.drey.Warp.zeroconf0";
 
@@ -55,8 +55,12 @@ pub struct PeerInfo {
 }
 
 impl PeerInfo {
-    pub fn new(machine_name: String, session_id: String, user_name: Option<String>, user_picture: Option<Vec<u8>>) -> Self {
-
+    pub fn new(
+        machine_name: String,
+        session_id: String,
+        user_name: Option<String>,
+        user_picture: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             socket_addrs: HashSet::new(),
             machine_name,
@@ -77,9 +81,7 @@ enum ControlMessage {
     Verify,
     Verified,
     NotVerified,
-    Wormhole {
-        code: String,
-    },
+    Wormhole { code: String },
     Remove,
 }
 
@@ -112,13 +114,10 @@ impl ControlServer {
         let listener = async_std::net::TcpListener::bind(&addrs[..]).await?;
         let state = Arc::new(RwLock::new(ControlServerStateInner {
             my_info,
-            peers: Default::default()
+            peers: Default::default(),
         }));
 
-        Ok(Self {
-            listener,
-            state,
-        })
+        Ok(Self { listener, state })
     }
 
     pub fn port(&self) -> u16 {
@@ -132,31 +131,39 @@ impl ControlServer {
     pub async fn wait_for_connection(&mut self) {
         while let Some(stream) = self.listener.incoming().next().await {
             println!("Connection!");
-            if let Ok(stream) = stream {
-                let state = self.state.clone();
-                let info = state.read().my_info.clone();
-                async_std::task::spawn(async move {
-                    let ws = async_tungstenite::accept_async(stream).await;
-                    if let Ok(mut ws) = ws {
-                        let mut connection = ControlServerConnection::new(&mut ws, state);
-                        if let Err(err) = connection.handle_connection().await {
-                            println!("Connection error: {}", err);
-                        }
+            let Ok(stream) = stream else {
+                return;
+            };
 
-                        if !ws.is_terminated() {
-                            println!("Closing websocket");
-                            match ws.close(None).await {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    if !matches!(err, tungstenite::Error::ConnectionClosed) {
-                                        println!("Websocket connection error: {}", err);
-                                    }
-                                }
+            let state = self.state.clone();
+            let Ok(peer_addr) = stream.peer_addr() else {
+                println!("Peer doesn't have an address");
+                continue;
+            };
+
+            async_std::task::spawn(async move {
+                let Ok(mut ws) = async_tungstenite::accept_async(stream).await else {
+                    println!("Connection not a websocket");
+                    return;
+                };
+
+                let mut connection = ControlServerConnection::new(&mut ws, state, peer_addr);
+                if let Err(err) = connection.handle_connection().await {
+                    println!("Connection error: {}", err);
+                }
+
+                if !ws.is_terminated() {
+                    println!("Closing websocket");
+                    match ws.close(None).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            if !matches!(err, tungstenite::Error::ConnectionClosed) {
+                                println!("Websocket connection error: {}", err);
                             }
                         }
                     }
-                });
-            }
+                }
+            });
         }
     }
 
@@ -165,10 +172,13 @@ impl ControlServer {
             println!("Connecting to {}", socket_addr);
             let stream = TcpStream::connect(socket_addr).await.unwrap();
             println!("Connected");
-            let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr.to_string())).unwrap();
-            let (mut ws, response) = async_tungstenite::client_async(server_url, stream).await.unwrap();
-            let mut connection = ControlServerConnection::new(&mut ws, state);
-            connection.client_connection(socket_addr).await.unwrap();
+            let server_url =
+                url::Url::parse(&format!("ws://{}/v1", socket_addr.to_string())).unwrap();
+            let (mut ws, response) = async_tungstenite::client_async(server_url, stream)
+                .await
+                .unwrap();
+            let mut connection = ControlServerConnection::new(&mut ws, state, socket_addr);
+            connection.client_connection().await.unwrap();
         });
     }
 }
@@ -178,50 +188,48 @@ struct ControlServerConnection<'a> {
     state: ControlServerState,
     peer_id: Option<String>,
     verified: bool,
+    peer_addr: SocketAddr,
 }
 
 impl<'a> ControlServerConnection<'a> {
-    pub fn new(websocket: &'a mut WebSocketStream<TcpStream>, state: ControlServerState) -> Self {
+    pub fn new(
+        websocket: &'a mut WebSocketStream<TcpStream>,
+        state: ControlServerState,
+        peer_addr: SocketAddr,
+    ) -> Self {
         Self {
             websocket,
             state,
             peer_id: None,
             verified: false,
+            peer_addr,
         }
     }
 
-    pub async fn send_msg(&mut self,
-                      msg: &ControlMessage,
-    ) -> Result<(), tungstenite::Error> {
+    pub async fn send_msg(&mut self, msg: &ControlMessage) -> Result<(), tungstenite::Error> {
         let json = serde_json::to_string(msg).unwrap();
         println!("Send: {}", json);
         self.websocket.send(json.into()).await
     }
 
-    async fn receive_msg(&mut self,
-    ) -> Result<ControlMessage, ConnectionError> {
-        while let Some(msg) = self.websocket.next().await {
+    async fn receive_msg(&mut self) -> Result<ControlMessage, ConnectionError> {
+        while let Some(Ok(msg)) = self.websocket.next().await {
             return match msg {
-                Ok(msg) => match msg {
-                    tungstenite::Message::Text(msg_txt) => {
-                        println!("Receive: {}", msg_txt);
-                        let client_msg = serde_json::from_str(&msg_txt);
-                        if let Ok(client_msg) = client_msg {
-                            Ok(client_msg)
-                        } else {
-                            Err(ConnectionError::JsonParse(msg_txt))
-                        }
-                    }
-                    tungstenite::Message::Close(frame) => Err(ConnectionError::Closed(frame)),
-                    tungstenite::Message::Ping(data) => {
-                        self.websocket.send(tungstenite::Message::Pong(data)).await?;
+                tungstenite::Message::Text(msg_txt) => {
+                    println!("Receive: {}", msg_txt);
+                    let client_msg = serde_json::from_str(&msg_txt);
+                    client_msg.map_err(|err| ConnectionError::JsonParse(msg_txt))
+                }
+                tungstenite::Message::Close(frame) => Err(ConnectionError::Closed(frame)),
+                tungstenite::Message::Ping(data) => {
+                    self.websocket
+                        .send(tungstenite::Message::Pong(data))
+                        .await?;
 
-                        // Wait for a new message, this one isn't interesting
-                        continue;
-                    }
-                    msg => Err(ConnectionError::UnexpectedType(msg)),
-                },
-                Err(err) => Err(err.into()),
+                    // Wait for a new message, this one isn't interesting
+                    continue;
+                }
+                msg => Err(ConnectionError::UnexpectedType(msg)),
             };
         }
 
@@ -241,17 +249,27 @@ impl<'a> ControlServerConnection<'a> {
             }
             ControlMessage::Info(peer_info) => {
                 println!("Received peer info: {:?}", peer_info);
-                self.peer_id = Some(peer_info.session_id.clone());
+                let peer_addr = self.peer_addr.clone();
+                let peer_id = peer_info.session_id.clone();
+                self.peer_id = Some(peer_id.clone());
                 let mut lock = self.state.write();
+
                 if !lock.peers.contains_key(&peer_info.session_id) {
                     if peer_info.session_id == lock.my_info.session_id {
                         println!("Accidentally connected to myself");
                         return Err(ConnectionError::PeerExists);
                     }
 
-                    lock.peers.insert(peer_info.session_id.clone(), peer_info.clone());
+                    let mut peer_info = peer_info.clone();
+                    peer_info.socket_addrs.insert(peer_addr);
+
+                    lock.peers.insert(peer_id, peer_info);
                 } else {
                     println!("Peer already exists");
+                    lock.peers
+                        .get_mut(&peer_info.session_id)
+                        .map(|peer| peer.socket_addrs.insert(peer_addr));
+
                     return Err(ConnectionError::PeerExists);
                 }
             }
@@ -263,7 +281,7 @@ impl<'a> ControlServerConnection<'a> {
                     self.send_msg(&ControlMessage::Wormhole { code }).await?;
                 }
             }
-            ControlMessage::Wormhole { code} => {
+            ControlMessage::Wormhole { code } => {
                 if !self.verified {
                     self.send_msg(&ControlMessage::NotVerified).await?;
                 } else {
@@ -311,25 +329,12 @@ impl<'a> ControlServerConnection<'a> {
         Ok(())
     }
 
-    pub async fn client_connection(mut self, socket_addr: SocketAddr) -> Result<(), ConnectionError> {
+    pub async fn client_connection(mut self) -> Result<(), ConnectionError> {
         println!("Client connection");
         self.send_msg(&ControlMessage::RequestInfo).await?;
         // This will err if peer already exists
         let msg = self.receive_msg().await?;
         self.handle_message(&msg).await?;
-
-        // Did we receive peer information?
-        let peer_id = if let Some(peer_id) = &self.peer_id {
-            // Set address of this peer
-            let mut lock = self.state.write();
-            if let Some(peer) = lock.peers.get_mut(peer_id) {
-                peer.socket_addrs.insert(socket_addr);
-            }
-
-            peer_id
-        } else {
-            return Err(ConnectionError::VerificationFailed);
-        };
 
         println!("Verifying peer connection");
         self.send_msg(&ControlMessage::Verify).await?;

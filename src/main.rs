@@ -2,10 +2,10 @@
 #![warn(unused_crate_dependencies)]
 #![allow(dead_code)]
 
-mod service;
-mod network;
-mod zeroconf;
 mod control;
+mod network;
+mod service;
+mod zeroconf;
 
 #[async_std::main]
 async fn main() {
