@@ -37,6 +37,10 @@ impl DevicePublicKey {
         self.public_key.to_bytes().to_vec()
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        self.public_key.as_bytes()
+    }
+
     pub fn verify(&self, message: &[u8], signature_bytes: &[u8]) -> bool {
         if let Ok(signature) = ed25519_dalek::Signature::from_bytes(signature_bytes) {
             self.public_key.verify(message, &signature).is_ok()

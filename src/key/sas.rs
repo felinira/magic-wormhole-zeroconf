@@ -2,6 +2,7 @@
 /// [here](https://matrix.org/docs/guides/implementing-more-advanced-e-2-ee-features-such-as-cross-signing)
 use crate::control::message::PeerInfo;
 use hkdf::Hkdf;
+use sha2::Digest;
 use sha2::Sha256;
 
 pub struct Sas {
@@ -17,23 +18,24 @@ impl Sas {
     /// This uses the key derived in the key exchange in addition to the session id stored in the
     /// PeerInfo structs to generate a strong SAS
     pub fn new_hkdf_sha265(
-        our_key: &str,
-        our_info: &PeerInfo,
-        their_key: &str,
-        their_info: &PeerInfo,
+        shared_key: &[u8],
+        our_key: &[u8],
+        their_key: &[u8],
+        client: bool,
     ) -> Self {
-        let our_sas_info = format!(
-            "{}|{}|{}",
-            our_key, our_info.service_uuid, our_info.service_uuid
-        );
-        let their_sas_info = format!(
-            "{}|{}|{}",
-            their_key, their_info.service_uuid, their_info.service_uuid
-        );
+        let shared_key_hash = Self::hash_sha256(shared_key);
+        let our_key_hash = Self::hash_sha256(our_key);
+        let their_key_hash = Self::hash_sha256(their_key);
+
+        let combined_sas_info = if client {
+            format!("{}|{}", our_key_hash, their_key_hash)
+        } else {
+            format!("{}|{}", their_key_hash, our_key_hash)
+        };
 
         let sas_string = format!(
             "MAGIC_WORMHOLE_ZEROCONF_VERIFICATION_SAS|{}|{}",
-            our_sas_info, their_sas_info
+            shared_key_hash, combined_sas_info
         );
 
         println!("sas string: {}", sas_string);
@@ -41,6 +43,14 @@ impl Sas {
         let hkdf_sha265 = Self::generate_hkdf(&sas_string);
 
         Self { hkdf_sha265 }
+    }
+
+    fn hash_sha256(data: &[u8]) -> String {
+        // create a Sha256 object
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash_data = hasher.finalize();
+        hex::encode(hash_data)
     }
 
     fn generate_hkdf(input: &str) -> [u8; 42] {
@@ -58,10 +68,10 @@ impl Sas {
     /// *Panics*
     ///
     /// When length is > 85 this function will panic
-    pub fn get_emoji_string(&self, length: usize) -> String {
+    pub fn get_emoji_string(&self, length: usize) -> (String, String) {
         let byte_input = &self.hkdf_sha265;
         let mut output_string = String::new();
-        let mut debug_string = String::new();
+        let mut verbose_string = String::new();
 
         let mut table_index = 0;
 
@@ -79,16 +89,16 @@ impl Sas {
                 let (emoji, emoji_name) = EMOJI_TABLE[table_index as usize];
 
                 output_string.push_str(emoji);
-                debug_string.push_str(&format!("{emoji} ({emoji_name}) "));
+                verbose_string.push_str(&format!("{emoji} ({emoji_name}) "));
 
                 // cleanup
                 table_index = 0;
             }
         }
 
-        println!("{debug_string}");
+        println!("{verbose_string}");
 
-        output_string
+        (output_string, verbose_string)
     }
 }
 

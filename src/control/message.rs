@@ -41,7 +41,9 @@ pub enum DecryptedMessage {
     RequestInfo,
     Info(PeerInfo),
     AllocWormhole,
-    VerificationFailed,
+    UserAuthenticate,
+    AuthenticationSuccess,
+    AuthenticationFailed,
     Wormhole {
         port: u16,
         code: String,
