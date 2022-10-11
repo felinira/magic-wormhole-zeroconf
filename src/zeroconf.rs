@@ -42,7 +42,7 @@ impl ZeroconfService {
                 .insert("uuid", &service_uuid.to_string())
                 .unwrap();
             txt_record
-                .insert("mailbox-port", &control_port.to_string())
+                .insert("mailbox-port", &mailbox_port.to_string())
                 .unwrap();
 
             service.set_registered_callback(Box::new(Self::on_service_registered));

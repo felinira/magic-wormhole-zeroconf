@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 mod control;
+mod key;
 mod network;
 mod service;
 mod zeroconf;

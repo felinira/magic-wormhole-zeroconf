@@ -142,9 +142,12 @@ impl ControlServer {
             };
 
             async_std::task::spawn(async move {
-                let Ok(mut ws) = async_tungstenite::accept_async(stream).await else {
-                    println!("Connection not a websocket");
-                    return;
+                let mut ws = match async_tungstenite::accept_async(stream).await {
+                    Ok(ws) => ws,
+                    Err(err) => {
+                        println!("Websocket error: {}", err);
+                        return;
+                    }
                 };
 
                 let mut connection = ControlServerConnection::new(&mut ws, state, peer_addr);
@@ -183,17 +186,20 @@ impl ControlServer {
     }
 }
 
-struct ControlServerConnection<'a> {
-    websocket: &'a mut WebSocketStream<TcpStream>,
+struct ControlServerConnection<'a, T> {
+    websocket: &'a mut WebSocketStream<T>,
     state: ControlServerState,
     peer_id: Option<String>,
     verified: bool,
     peer_addr: SocketAddr,
 }
 
-impl<'a> ControlServerConnection<'a> {
+impl<'a, T> ControlServerConnection<'a, T>
+where
+    T: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
     pub fn new(
-        websocket: &'a mut WebSocketStream<TcpStream>,
+        websocket: &'a mut WebSocketStream<T>,
         state: ControlServerState,
         peer_addr: SocketAddr,
     ) -> Self {

@@ -41,10 +41,12 @@ async fn handle_service_discovered(state: ControlServerState, discovery: &Servic
         return;
     }
 
-    let Some(control_port) = txt.get("control-port")  else {
-        println!("No control-port specified in mDNS txt record");
+    let Some(mailbox_port) = txt.get("mailbox-port")  else {
+        println!("No mailbox-port specified in mDNS txt record");
         return;
     };
+
+    let control_port = discovery.port();
 
     // Connect to the control port
     let socket_addr = if discovery.address().contains(":") {
