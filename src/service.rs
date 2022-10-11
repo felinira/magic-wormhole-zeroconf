@@ -1,9 +1,10 @@
-use crate::control::{ControlServer, ControlServerState, ControlServerStateInner, PeerInfo};
+use crate::control::message::PeerInfo;
+use crate::control::service::{ControlServer, ControlServerState};
+use crate::key;
 use crate::zeroconf::{ZeroconfBrowser, ZeroconfEvent, ZeroconfService};
-use async_std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use futures::{select, FutureExt};
-use magic_wormhole_mailbox::{rendezvous_server, RendezvousServer};
-use sysinfo::{SystemExt, UserExt};
+use magic_wormhole_mailbox::rendezvous_server;
+use sysinfo::SystemExt;
 use zeroconf::prelude::*;
 use zeroconf::ServiceDiscovery;
 
@@ -13,19 +14,19 @@ pub enum ServiceMessage {
     PeersChanged,
 }
 
-fn system_peer_info(my_id: uuid::Uuid) -> PeerInfo {
+fn system_peer_info(my_id: String) -> PeerInfo {
     let system_info = sysinfo::System::new();
 
     PeerInfo::new(
         system_info.host_name().unwrap_or("?".to_string()),
-        my_id.to_string(),
+        my_id,
         None,
         None,
     )
 }
 
 async fn handle_service_discovered(state: ControlServerState, discovery: &ServiceDiscovery) {
-    let my_id = &state.read().my_info.session_id.clone();
+    let my_id = &state.read().my_info.service_uuid.clone();
     let txt = match &discovery.txt() {
         None => return,
         Some(txt) => txt,
@@ -82,12 +83,14 @@ async fn handle_service_discovered(state: ControlServerState, discovery: &Servic
 
 pub async fn run() -> Result<(), std::io::Error> {
     let my_id = uuid::Uuid::new_v4();
-    let my_peer_info = system_peer_info(my_id);
+
+    let key_pair = key::device::DeviceKeyPair::generate_new_ed25519();
+    let my_peer_info = system_peer_info(my_id.to_string());
 
     let mut mailbox = rendezvous_server::RendezvousServer::run(0).await.unwrap();
     println!("Rendezvous: Listening on port: {}", mailbox.port());
 
-    let mut control = ControlServer::run(0, my_peer_info).await?;
+    let mut control = ControlServer::run(0, mailbox.port(), my_peer_info, key_pair).await?;
     println!("Control: Listening on port: {}", control.port());
     let state = control.state();
 
