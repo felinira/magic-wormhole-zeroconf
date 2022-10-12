@@ -1,6 +1,6 @@
 /// The verification flow is based on the matrix key verification flow as detailed
 /// [here](https://matrix.org/docs/guides/implementing-more-advanced-e-2-ee-features-such-as-cross-signing)
-use crate::control::message::PeerInfo;
+use crate::control::message::PeerInfoMessage;
 use hkdf::Hkdf;
 use sha2::Digest;
 use sha2::Sha256;
@@ -174,20 +174,20 @@ const EMOJI_TABLE: [(&str, &str); 64] = [
 #[cfg(test)]
 mod test {
     use super::Sas;
-    use crate::control::message::PeerInfo;
+    use crate::control::message::PeerInfoMessage;
 
     #[test]
     fn test_sas() {
         let our_key = "1234";
         let their_key = "9876";
 
-        let our_info = PeerInfo::new(
+        let our_info = PeerInfoMessage::new(
             "test1".to_string(),
             "7844286e-e00c-46a7-8f97-4a5139ca7c32".to_string(),
             None,
             None,
         );
-        let their_info = PeerInfo::new(
+        let their_info = PeerInfoMessage::new(
             "test2".to_string(),
             "f6aaae29-51c7-40d6-b406-bec5d497a807".to_string(),
             None,

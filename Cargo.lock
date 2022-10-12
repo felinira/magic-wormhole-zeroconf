@@ -1067,6 +1067,7 @@ dependencies = [
 name = "magic-wormhole-zeroconf"
 version = "0.1.0"
 dependencies = [
+ "async-broadcast",
  "async-channel",
  "async-std",
  "async-tungstenite",

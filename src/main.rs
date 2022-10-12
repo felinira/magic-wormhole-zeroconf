@@ -10,5 +10,6 @@ mod zeroconf;
 
 #[async_std::main]
 async fn main() {
-    service::run().await.unwrap();
+    let mut service = service::Service::new();
+    service.run().await.unwrap();
 }

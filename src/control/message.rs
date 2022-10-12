@@ -3,16 +3,14 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
-pub struct PeerInfo {
-    #[serde(skip)]
-    pub socket_addrs: HashSet<SocketAddr>,
+pub struct PeerInfoMessage {
     pub machine_name: String,
     pub service_uuid: String,
     pub user_name: Option<String>,
     pub user_picture: Option<Vec<u8>>,
 }
 
-impl PeerInfo {
+impl PeerInfoMessage {
     pub fn new(
         machine_name: String,
         service_uuid: String,
@@ -20,7 +18,6 @@ impl PeerInfo {
         user_picture: Option<Vec<u8>>,
     ) -> Self {
         Self {
-            socket_addrs: HashSet::new(),
             machine_name,
             service_uuid,
             user_name,
@@ -39,7 +36,7 @@ pub enum DecryptedMessage {
         signature: Vec<u8>,
     },
     RequestInfo,
-    Info(PeerInfo),
+    Info(PeerInfoMessage),
     AllocWormhole,
     UserAuthenticate,
     AuthenticationSuccess,
