@@ -1093,6 +1093,7 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroconf",
+ "zeroize",
 ]
 
 [[package]]

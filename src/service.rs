@@ -1,5 +1,5 @@
 use crate::control::message::PeerInfoMessage;
-use crate::control::server::{ControlServer, PeerInfo};
+use crate::control::server::{ControlServer, Peer};
 use crate::key;
 use crate::key::device::DeviceKeyPair;
 use crate::state::ServiceState;
@@ -172,22 +172,23 @@ impl Service {
         let request_receiver = self.request_receiver.take().unwrap();
 
         loop {
-            let mut zeroconf = zeroconf_receiver.recv().fuse();
+            println!("Listening for events");
             let mut rendezvous = Box::pin(rendezvous_server.wait_for_connection()).fuse();
             let mut control = Box::pin(control_server.wait_for_connection()).fuse();
             let mut request = Box::pin(request_receiver.recv()).fuse();
 
             select! {
-                msg = zeroconf => if let Ok(msg) = &msg {
+                msg = zeroconf_receiver.recv().fuse() => if let Ok(msg) = &msg {
                     match msg {
                         ZeroconfEvent::ServiceDiscovered(discovery) => {
+                            println!("Service discovered event");
                             self.handle_service_discovered(discovery).await?;
                         },
                         ZeroconfEvent::ServiceRegistered => {
                             self.handle_service_registered().await?;
-                        }
-                        _ => {
-                            todo!()
+                        },
+                        ZeroconfEvent::Error(err) => {
+                            println!("Zeroconf error: {:?}", err);
                         }
                     }
                 },

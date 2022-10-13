@@ -26,7 +26,7 @@ impl PeerInfoMessage {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum DecryptedMessage {
     KeyVerificationEd25519 {
         challenge: Vec<u8>,
@@ -38,6 +38,7 @@ pub enum DecryptedMessage {
     RequestInfo,
     Info(PeerInfoMessage),
     AllocWormhole,
+    InitiateTransfer,
     UserAuthenticate,
     AuthenticationSuccess,
     AuthenticationFailed,
@@ -64,7 +65,7 @@ pub enum CryptoAlgorithms {
 #[serde(tag = "type")]
 pub(crate) enum ControlMessage {
     Welcome {
-        peer_id: String,
+        id: String,
     },
     KeyExchangeX25519 {
         algorithms: CryptoAlgorithms,

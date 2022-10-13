@@ -1,5 +1,5 @@
 use crate::control::message::PeerInfoMessage;
-use crate::control::server::PeerInfo;
+use crate::control::server::Peer;
 use crate::key::device::DeviceKeyPair;
 use crate::service::ServiceRequest;
 use crate::ServiceMessage;
@@ -12,7 +12,7 @@ pub struct ServiceStateInner {
     pub my_info: PeerInfoMessage,
     pub device_key: DeviceKeyPair,
     pub authorized_keys: HashSet<Vec<u8>>,
-    pub peers: HashMap<String, PeerInfo>,
+    pub peers: HashMap<String, Peer>,
 
     pub service_sender: async_channel::Sender<ServiceMessage>,
 }

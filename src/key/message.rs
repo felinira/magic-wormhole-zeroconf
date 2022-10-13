@@ -3,6 +3,7 @@ use crate::control::server::ConnectionError;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{AeadCore, KeyInit};
 
+#[derive(Clone)]
 pub struct MessageCipher {
     cipher: chacha20poly1305::ChaCha20Poly1305,
 }
@@ -12,6 +13,10 @@ impl MessageCipher {
         let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(secret).ok()?;
 
         Some(Self { cipher })
+    }
+
+    pub fn from_cipher(cipher: chacha20poly1305::ChaCha20Poly1305) -> Self {
+        Self { cipher }
     }
 
     pub fn encrypt_message(

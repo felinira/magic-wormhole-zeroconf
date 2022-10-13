@@ -10,10 +10,13 @@ use async_std::net::TcpStream;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
 use futures::{SinkExt, StreamExt};
+use hkdf::Hkdf;
 use rand::RngCore;
+use sha2::Sha256;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use x25519_dalek::SharedSecret;
+use zeroize::Zeroizing;
 
 const APP_ID: &'static str = "app.drey.Warp.zeroconf0";
 
@@ -51,27 +54,31 @@ pub enum ConnectionError {
     CryptoError,
 }
 
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
+#[derive(Clone)]
+pub struct Peer {
     pub socket_addrs: HashSet<SocketAddr>,
     pub public_key: Vec<u8>,
+    pub cipher: MessageCipher,
+    pub sas_secret: [u8; 32],
     pub authenticated: bool,
 
-    pub message: PeerInfoMessage,
+    pub message: Option<PeerInfoMessage>,
 }
 
-impl PeerInfo {
-    pub fn with_key_and_message(public_key: Vec<u8>, message: PeerInfoMessage) -> Self {
+impl Peer {
+    pub fn with_key(public_key: Vec<u8>, sas_secret: [u8; 32], cipher: MessageCipher) -> Self {
         Self {
             socket_addrs: Default::default(),
             public_key,
+            cipher,
+            sas_secret,
             authenticated: false,
-            message,
+            message: None,
         }
     }
 
     pub fn update_message(&mut self, message: PeerInfoMessage) {
-        self.message = message;
+        self.message = Some(message);
     }
 }
 
@@ -121,7 +128,7 @@ impl ControlServer {
                     }
                 };
 
-                let mut connection = ControlServerConnection::new(&mut ws, state, peer_addr);
+                let mut connection = ControlServerConnection::new(&mut ws, false, state, peer_addr);
                 if let Err(err) = connection.handle_connection().await {
                     println!("Connection error: {}", err);
                 }
@@ -151,7 +158,7 @@ impl ControlServer {
             let (mut ws, response) = async_tungstenite::client_async(server_url, stream)
                 .await
                 .unwrap();
-            let connection = ControlServerConnection::new(&mut ws, state, socket_addr);
+            let connection = ControlServerConnection::new(&mut ws, true, state, socket_addr);
             connection.client_connection().await.unwrap();
         });
     }
@@ -163,13 +170,11 @@ static HANDSHAKE_LOCK: async_std::sync::Mutex<()> = async_std::sync::Mutex::new(
 
 struct ControlServerConnection<'a, T> {
     websocket: &'a mut WebSocketStream<T>,
+    is_client: bool,
     state: ServiceState,
     peer_id: Option<String>,
-    shared_secret: Option<SharedSecret>,
     cipher: Option<MessageCipher>,
     challenge: Option<Vec<u8>>,
-    peer_key: Option<Vec<u8>>,
-    authenticated_peer: bool,
     peer_addr: SocketAddr,
 }
 
@@ -179,18 +184,17 @@ where
 {
     pub fn new(
         websocket: &'a mut WebSocketStream<T>,
+        is_client: bool,
         state: ServiceState,
         peer_addr: SocketAddr,
     ) -> Self {
         Self {
             websocket,
+            is_client,
             state,
             peer_id: None,
             cipher: None,
             challenge: None,
-            shared_secret: None,
-            peer_key: None,
-            authenticated_peer: false,
             peer_addr,
         }
     }
@@ -208,6 +212,8 @@ where
         let Some(cipher) = &mut self.cipher else {
             return Err(ConnectionError::CryptoError);
         };
+
+        println!("Sending message: {:?}", msg);
 
         let enc_msg = cipher.encrypt_message(&msg)?;
         Ok(self
@@ -249,7 +255,9 @@ where
             return Err(ConnectionError::CryptoError);
         };
 
-        cipher.decrypt_message(&encrypted)
+        let msg = cipher.decrypt_message(&encrypted)?;
+        println!("Receive decryption: {:?}", msg);
+        Ok(msg)
     }
 
     async fn alloc_code(&mut self) -> String {
@@ -261,6 +269,10 @@ where
         &mut self,
         msg: &DecryptedMessage,
     ) -> Result<(), ConnectionError> {
+        let Some(authenticated_peer) = self.peer_id.as_ref().and_then(|id| self.state.read().peers.get(id).map(|peer| peer.authenticated)) else {
+            return Err(ConnectionError::InvalidState);
+        };
+
         match msg {
             DecryptedMessage::RequestInfo => {
                 let my_info = self.state.read().my_info.clone();
@@ -272,9 +284,6 @@ where
                 let peer_addr = self.peer_addr.clone();
                 let peer_id = peer_info.service_uuid.clone();
                 self.peer_id = Some(peer_id.clone());
-                let Some(peer_key) = &self.peer_key else {
-                    return Err(ConnectionError::CryptoError);
-                };
 
                 let peer_info = {
                     // This block is needed to scope the lock for the await below
@@ -285,23 +294,14 @@ where
                             return Err(ConnectionError::PeerExists);
                         }
 
-                        let mut peer =
-                            PeerInfo::with_key_and_message(peer_key.clone(), peer_info.clone());
-                        peer.socket_addrs.insert(peer_addr);
-                        lock.peers.insert(peer_id.clone(), peer.clone());
-                        peer_info.clone()
+                        // We should have had this peer registered in the handshake
+                        return Err(ConnectionError::InvalidState);
                     } else {
                         println!("Peer already exists, checking key validity");
                         let Some(mut peer) = lock.peers
                             .get_mut(&peer_info.service_uuid) else {
                             return Err(ConnectionError::InvalidState);
                         };
-
-                        if peer.authenticated && !self.authenticated_peer {
-                            // Don't trust unauthenticated peer info if we already got successful auth
-                            // This means the peer uses different keys which can't be right
-                            return Err(ConnectionError::CryptoError);
-                        }
 
                         // Update the info and ip addresses
                         peer.update_message(peer_info.clone());
@@ -318,7 +318,7 @@ where
                     .map_err(|_| ConnectionError::InvalidState)?;
             }
             DecryptedMessage::AllocWormhole => {
-                if !self.authenticated_peer {
+                if !authenticated_peer {
                     self.send_encrypted_msg(DecryptedMessage::AuthenticationFailed)
                         .await?;
                 } else {
@@ -329,7 +329,7 @@ where
                 }
             }
             DecryptedMessage::Wormhole { port, code } => {
-                if !self.authenticated_peer {
+                if !authenticated_peer {
                     self.send_encrypted_msg(DecryptedMessage::AuthenticationFailed)
                         .await?;
                 } else {
@@ -339,6 +339,7 @@ where
                     );
                 }
             }
+            DecryptedMessage::InitiateTransfer => self.authenticate_peer(self.is_client).await?,
             DecryptedMessage::AuthenticationFailed => {
                 println!("Invalid verification message received from peer.");
                 return Err(ConnectionError::VerificationFailed);
@@ -390,12 +391,29 @@ where
     pub async fn authenticate_peer(&mut self, is_client: bool) -> Result<(), ConnectionError> {
         // Authentication stage: Here we compare the key to our authorized keys and decide whether
         // to do manual user verification
+        println!("authenticate_peer");
         let my_pubkey = self.state.read().device_key.public_key().to_vec();
-        let Some(their_pubkey) = &self.peer_key.clone() else {
+        let Some(peer_id) = self.peer_id.clone() else {
+            return Err(ConnectionError::InvalidState);
+        };
+
+        let Some(their_pubkey) = &self.state.read().peers.get(&peer_id).map(|peer| peer.public_key.clone()) else {
             return Err(ConnectionError::CryptoError);
         };
 
-        if self.state.read().authorized_keys.contains(their_pubkey) {
+        let mut do_user_auth = true;
+
+        if self.state.read().authorized_keys.contains(their_pubkey)
+            || self
+                .state
+                .read()
+                .peers
+                .get(&peer_id)
+                .map_or(false, |peer| peer.authenticated)
+        {
+            // We already authenticated the user. Now let's see if our peer agrees
+            self.send_encrypted_msg(DecryptedMessage::AuthenticationSuccess)
+                .await?;
             let msg = self.receive_encrypted_msg().await?;
             match msg {
                 DecryptedMessage::UserAuthenticate => {
@@ -403,7 +421,12 @@ where
                 }
                 DecryptedMessage::AuthenticationSuccess => {
                     // We agree that we don't need verification
-                    self.authenticated_peer = true;
+                    self.state
+                        .write()
+                        .peers
+                        .get_mut(&peer_id)
+                        .map(|peer| peer.authenticated = true);
+                    do_user_auth = false;
                 }
                 DecryptedMessage::AuthenticationFailed => {
                     println!("Authentication failed");
@@ -414,65 +437,49 @@ where
                     return Err(ConnectionError::CryptoError);
                 }
             }
-
-            self.authenticated_peer = true;
         }
 
-        if !self.authenticated_peer {
-            // We need to use verification
+        if do_user_auth {
+            // We need to use user authentication
             println!("User authentication");
             self.send_encrypted_msg(DecryptedMessage::UserAuthenticate)
                 .await?;
 
-            let Some(shared_secret) = &self.shared_secret else {
-                return Err(ConnectionError::CryptoError);
+            let Some(sas_secret) = self.state.read().peers.get(&peer_id).map(|peer| peer.sas_secret) else {
+                return Err(ConnectionError::InvalidState);
             };
 
             // Calculate SAS
-            let sas = Sas::new_hkdf_sha265(
-                self.shared_secret.as_ref().unwrap().as_bytes(),
-                &my_pubkey,
-                their_pubkey,
-                is_client,
-            );
+            let sas = Sas::new_hkdf_sha265(&sas_secret, &my_pubkey, their_pubkey, is_client);
+            println!("Authentication SAS emoji: {}", sas.get_emoji_string(6).1);
 
-            println!(
-                "Please verify that these emoji match (y/n): {}",
-                sas.get_emoji_string(6).1
-            );
-            let mut line_buf = String::new();
-            let stdin = async_std::io::stdin();
-            let mut verified_emoji = false;
+            // TODO: Emoji verification
+            self.send_encrypted_msg(DecryptedMessage::AuthenticationSuccess)
+                .await?;
 
-            while !verified_emoji {
-                stdin.read_line(&mut line_buf).await.unwrap();
-
-                if line_buf.to_lowercase() == "y" {
-                    self.send_encrypted_msg(DecryptedMessage::AuthenticationSuccess)
-                        .await?;
-                    verified_emoji = true;
-                } else if line_buf.to_lowercase() == "n" {
-                    self.send_encrypted_msg(DecryptedMessage::AuthenticationFailed)
-                        .await?;
-                    return Err(ConnectionError::CryptoError);
-                }
-
-                line_buf.clear();
-            }
-
-            let msg = self.receive_encrypted_msg().await?;
-            match msg {
-                DecryptedMessage::AuthenticationSuccess => {
-                    println!("Authentication success!");
-                    self.authenticated_peer = true;
-                }
-                DecryptedMessage::AuthenticationFailed => {
-                    println!("Authentication failed");
-                    return Err(ConnectionError::CryptoError);
-                }
-                _ => {
-                    println!("Expected authentication message");
-                    return Err(ConnectionError::CryptoError);
+            loop {
+                let msg = self.receive_encrypted_msg().await?;
+                match msg {
+                    DecryptedMessage::UserAuthenticate => {
+                        // They want to authenticate as well
+                    }
+                    DecryptedMessage::AuthenticationSuccess => {
+                        println!("Authentication success!");
+                        self.state
+                            .write()
+                            .peers
+                            .get_mut(&peer_id)
+                            .map(|peer| peer.authenticated = true);
+                        break;
+                    }
+                    DecryptedMessage::AuthenticationFailed => {
+                        println!("Authentication failed");
+                        return Err(ConnectionError::CryptoError);
+                    }
+                    _ => {
+                        println!("Expected authentication message");
+                        return Err(ConnectionError::CryptoError);
+                    }
                 }
             }
         }
@@ -490,117 +497,175 @@ where
         // 2. As only the handshake sets the shared secret, this will be in a stable state:
         //    We either have one, or we don't and need to do a key exchange
 
-        // Find out peer public key. Anyone could claim they are a specific peer, but we will verify
+        // Find out the peer id key. Anyone could claim they are a specific peer, but we will verify
         // this later after key exchange with the ed25519 certificate
+        let my_id = self.state.read().my_info.service_uuid.clone();
+        self.send_msg(&ControlMessage::Welcome { id: my_id.clone() })
+            .await?;
+        let msg = self.receive_msg().await?;
+        let peer_id = match msg {
+            ControlMessage::Welcome { id } => id,
+            _ => {
+                return Err(ConnectionError::InvalidState);
+            }
+        };
+        self.peer_id = Some(peer_id.clone());
 
-        println!("Key exchange");
-
-        // Key exchange
-        let my_ephemeral_secret = x25519_dalek::EphemeralSecret::new(rand::rngs::OsRng);
-        let my_ephemeral_pubkey = x25519_dalek::PublicKey::from(&my_ephemeral_secret);
-
-        self.send_msg(&ControlMessage::KeyExchangeX25519 {
-            algorithms: CryptoAlgorithms::Ed25519ChaCha20Poly1305,
-            public_key: my_ephemeral_pubkey.as_bytes().to_vec(),
-        })
-        .await?;
-
-        let ControlMessage::KeyExchangeX25519 {
-            algorithms, public_key: their_data
-        } = self.receive_msg().await? else {
-            return Err(ConnectionError::CryptoError);
+        // Now that we have the peer id we can check if we already made a handshake with this peer
+        // or someone claiming to be this peer.
+        // If the latter, they won't be able to do anything with our encrypted messages
+        let maybe_cipher = {
+            self.state
+                .read()
+                .peers
+                .get(&peer_id)
+                .map(|peer| peer.cipher.clone())
         };
 
-        if algorithms != CryptoAlgorithms::Ed25519ChaCha20Poly1305 {
-            return Err(ConnectionError::CryptoError);
-        }
+        if let Some(cipher) = maybe_cipher {
+            self.cipher = Some(cipher);
 
-        let their_data_32: [u8; 32] = their_data
-            .try_into()
-            .or(Err(ConnectionError::CryptoError))?;
+            // Now we just continue sending encrypted messages. The peer is supposed to save the
+            // cipher and know how to read them. If they don't something strange might be going
+            // on. If they don't agree with this we will be receiving a
+            // `ControlMessage::KeyExchangeX25519` from them which will abort the conversation.
+            // We are perfectly happy with this. As peers will generate a new ID when they restart
+            // there won't be any collisions here.
+        } else {
+            // Peer is unknown to us, we do a proper key exchange
+            println!("Key exchange");
 
-        // We use the secret to generate our cipher
-        let their_ephemeral_pubkey = x25519_dalek::PublicKey::from(their_data_32);
-        let shared_secret = my_ephemeral_secret.diffie_hellman(&their_ephemeral_pubkey);
-        let cipher = MessageCipher::from_secret(&shared_secret.to_bytes())
-            .ok_or(ConnectionError::CryptoError)?;
-        self.shared_secret = Some(shared_secret);
-        self.cipher = Some(cipher);
+            // Key exchange. We generate ephemeral secrets on both sides and use ECDH with x25519
+            let my_ephemeral_secret = x25519_dalek::EphemeralSecret::new(rand::rngs::OsRng);
+            let my_ephemeral_pubkey = x25519_dalek::PublicKey::from(&my_ephemeral_secret);
 
-        // Now we have a cipher, let's continue encrypted
-        let mut challenge = vec![64u8; 64];
-        rand::rngs::OsRng::default().fill_bytes(&mut challenge);
-        self.challenge = Some(challenge.clone());
-
-        self.send_encrypted_msg(DecryptedMessage::KeyVerificationEd25519 { challenge })
+            self.send_msg(&ControlMessage::KeyExchangeX25519 {
+                algorithms: CryptoAlgorithms::Ed25519ChaCha20Poly1305,
+                public_key: my_ephemeral_pubkey.as_bytes().to_vec(),
+            })
             .await?;
 
-        let mut other_verified_key = false;
-        let mut verified_key = false;
-        while !verified_key || !other_verified_key {
-            let msg = self.receive_encrypted_msg().await?;
-            match msg {
-                DecryptedMessage::KeyVerificationEd25519 { challenge } => {
-                    if challenge.len() < 64 {
-                        return Err(ConnectionError::CryptoError);
+            let ControlMessage::KeyExchangeX25519 {
+                algorithms, public_key: their_data
+            } = self.receive_msg().await? else {
+                return Err(ConnectionError::CryptoError);
+            };
+
+            if algorithms != CryptoAlgorithms::Ed25519ChaCha20Poly1305 {
+                return Err(ConnectionError::CryptoError);
+            }
+
+            let their_data_32: [u8; 32] = their_data
+                .try_into()
+                .or(Err(ConnectionError::CryptoError))?;
+
+            // We use the secret to generate our cipher
+            let their_ephemeral_pubkey = x25519_dalek::PublicKey::from(their_data_32);
+            let shared_secret = my_ephemeral_secret.diffie_hellman(&their_ephemeral_pubkey);
+
+            // Now we derive two keys: First one is the cipher key we use for encryption
+            let hk = Hkdf::<Sha256>::new(None, shared_secret.as_bytes());
+
+            // The cipher key needs to be 64 bytes long
+            let mut cipher_key = [0u8; 64];
+            hk.expand(b"cipher", &mut cipher_key)
+                .expect("64 is a valid length for Sha256 to output");
+            let cipher = MessageCipher::from_secret(&shared_secret.to_bytes())
+                .ok_or(ConnectionError::CryptoError)?;
+            self.cipher = Some(cipher);
+
+            // The second key to be derived is the SAS secret we use for peer authentication later
+            let mut sas_secret = [0u8; 32];
+            hk.expand(b"sas", &mut sas_secret)
+                .expect("32 is a valid length for Sha256 to output");
+
+            // Now we have a cipher, let's continue encrypted
+            let mut challenge = vec![64u8; 64];
+            rand::rngs::OsRng::default().fill_bytes(&mut challenge);
+            self.challenge = Some(challenge.clone());
+
+            self.send_encrypted_msg(DecryptedMessage::KeyVerificationEd25519 { challenge })
+                .await?;
+
+            let mut other_verified_key = false;
+            let mut verified_key = false;
+            let mut peer_key = None;
+            while !verified_key || !other_verified_key {
+                let msg = self.receive_encrypted_msg().await?;
+                match msg {
+                    DecryptedMessage::KeyVerificationEd25519 { challenge } => {
+                        if challenge.len() < 64 {
+                            return Err(ConnectionError::CryptoError);
+                        }
+
+                        // We need to sign the challenge
+                        let (public_key, signature) = {
+                            let device_key = &mut self.state.write().device_key;
+                            let public_key = device_key.public_key().to_vec();
+
+                            // Concatenate our public key, our peer id and challenge
+                            // This proves that id and public key match, and that we own the private key
+                            let mut data = challenge.clone();
+                            data.extend_from_slice(&public_key);
+                            data.extend_from_slice(my_id.as_bytes());
+                            let signature = device_key.sign(&data);
+                            (public_key, signature)
+                        };
+
+                        self.send_encrypted_msg(DecryptedMessage::KeyVerificationResponseEd25519 {
+                            public_key,
+                            signature,
+                        })
+                        .await?;
+
+                        other_verified_key = true;
                     }
-
-                    // We need to sign the challenge
-                    let (public_key, signature) = {
-                        let device_key = &mut self.state.write().device_key;
-                        let public_key = device_key.public_key().to_vec();
-
-                        // concatenate public key and challenge
-                        let mut data = challenge.clone();
-                        data.extend_from_slice(&public_key);
-                        let signature = device_key.sign(&data);
-                        (public_key, signature)
-                    };
-
-                    self.send_encrypted_msg(DecryptedMessage::KeyVerificationResponseEd25519 {
+                    DecryptedMessage::KeyVerificationResponseEd25519 {
                         public_key,
                         signature,
-                    })
-                    .await?;
+                    } => {
+                        let Some(challenge) = &self.challenge else {
+                            return Err(ConnectionError::CryptoError);
+                        };
 
-                    other_verified_key = true;
-                }
-                DecryptedMessage::KeyVerificationResponseEd25519 {
-                    public_key,
-                    signature,
-                } => {
-                    let Some(challenge) = &self.challenge else {
-                        return Err(ConnectionError::CryptoError);
-                    };
+                        if challenge.is_empty() || public_key.is_empty() || signature.is_empty() {
+                            return Err(ConnectionError::CryptoError);
+                        }
 
-                    if challenge.is_empty() || public_key.is_empty() || signature.is_empty() {
+                        println!("Challenge: {:?}", challenge);
+
+                        // Check if the signature matches the challenge + key
+                        let mut data = challenge.clone();
+                        data.extend_from_slice(&public_key);
+                        data.extend_from_slice(&peer_id.as_bytes());
+                        let key = DevicePublicKey::from_data(&public_key)
+                            .ok_or(ConnectionError::CryptoError)?;
+                        if !key.verify(&data, &signature) {
+                            return Err(ConnectionError::CryptoError);
+                        } else {
+                            verified_key = true;
+                            peer_key = Some(public_key);
+                        }
+
+                        self.challenge = None;
+                    }
+                    _ => {
+                        println!("Unexpected message, expected key verification");
                         return Err(ConnectionError::CryptoError);
                     }
-
-                    println!("Challenge: {:?}", challenge);
-
-                    // Check if the signature matches the challenge + key
-                    let mut data = challenge.clone();
-                    data.extend_from_slice(&public_key);
-                    let key = DevicePublicKey::from_data(&public_key)
-                        .ok_or(ConnectionError::CryptoError)?;
-                    if !key.verify(&data, &signature) {
-                        return Err(ConnectionError::CryptoError);
-                    } else {
-                        verified_key = true;
-                        self.peer_key = Some(public_key);
-                    }
-
-                    self.challenge = None;
-                }
-                msg => {
-                    println!("Unexpected message, expected key verification");
-                    return Err(ConnectionError::CryptoError);
                 }
             }
-        }
 
-        println!("Verified the public key of peer");
+            println!("Verified the public key of peer");
+
+            // Insert the peer into peer list
+            let (Some(peer_key), Some(cipher)) = (&peer_key, &self.cipher) else {
+                return Err(ConnectionError::InvalidState);
+            };
+
+            let mut peer = Peer::with_key(peer_key.clone(), sas_secret, cipher.clone());
+            self.state.write().peers.insert(peer_id, peer);
+        };
 
         // Make sure the handshake lock exists until the end of this function.
         // drop consumes the lock, therefore it must exist up until this point.
@@ -619,11 +684,9 @@ where
         self.handle_decrypted_message(&msg).await?;
 
         println!("Verifying peer connection");
-        self.send_encrypted_msg(DecryptedMessage::UserAuthenticate)
+        self.send_encrypted_msg(DecryptedMessage::InitiateTransfer)
             .await?;
-        // This will err if not verified
-        let msg = self.receive_encrypted_msg().await?;
-        self.handle_decrypted_message(&msg).await?;
+        self.authenticate_peer(true).await?;
 
         println!("Allocating wormhole");
         self.send_encrypted_msg(DecryptedMessage::AllocWormhole)
