@@ -1,5 +1,5 @@
 use crate::control::message::{DecryptedMessage, EncryptedMessage};
-use crate::control::service::ConnectionError;
+use crate::control::server::ConnectionError;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{AeadCore, KeyInit};
 

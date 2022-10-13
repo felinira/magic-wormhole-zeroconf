@@ -1072,6 +1072,7 @@ dependencies = [
  "async-std",
  "async-tungstenite",
  "chacha20poly1305",
+ "derive_more",
  "ed25519-dalek",
  "futures",
  "hex",

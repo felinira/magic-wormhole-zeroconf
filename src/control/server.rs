@@ -1,18 +1,19 @@
 use crate::control::message::{
-    ControlMessage, CryptoAlgorithms, DecryptedMessage, EncryptedMessage, PeerInfoMessage,
+    ControlMessage, CryptoAlgorithms, DecryptedMessage, PeerInfoMessage,
 };
-use crate::key::device::{DeviceKeyPair, DevicePublicKey};
+use crate::key::device::DevicePublicKey;
 use crate::key::message::MessageCipher;
 use crate::key::sas::Sas;
+use crate::state::ServiceState;
+use crate::ServiceMessage;
 use async_std::net::TcpStream;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
-use futures::{select, FutureExt, SinkExt, StreamExt};
-use parking_lot::RwLock;
-use rand::{Rng, RngCore};
-use std::collections::{HashMap, HashSet};
+use futures::{SinkExt, StreamExt};
+use rand::RngCore;
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use x25519_dalek::SharedSecret;
 
 const APP_ID: &'static str = "app.drey.Warp.zeroconf0";
 
@@ -74,42 +75,19 @@ impl PeerInfo {
     }
 }
 
-pub struct ControlServerStateInner {
-    pub rendezvous_port: u16,
-    pub my_info: PeerInfoMessage,
-    pub device_key: DeviceKeyPair,
-    pub authorized_keys: HashSet<Vec<u8>>,
-    pub peers: HashMap<String, PeerInfo>,
-}
-
-pub type ControlServerState = Arc<RwLock<ControlServerStateInner>>;
-
 pub struct ControlServer {
     listener: async_std::net::TcpListener,
-    state: ControlServerState,
+    state: ServiceState,
 }
 
 impl ControlServer {
-    pub async fn run(
-        port: u16,
-        rendezvous_port: u16,
-        my_info_msg: PeerInfoMessage,
-        device_key: DeviceKeyPair,
-    ) -> Result<Self, std::io::Error> {
+    pub async fn run(state: ServiceState, port: u16) -> Result<Self, std::io::Error> {
         let addrs: [async_std::net::SocketAddr; 2] = [
             format!("[::]:{}", port).parse().unwrap(),
             format!("0.0.0.0:{}", port).parse().unwrap(),
         ];
 
         let listener = async_std::net::TcpListener::bind(&addrs[..]).await?;
-        let state = Arc::new(RwLock::new(ControlServerStateInner {
-            my_info: my_info_msg,
-            rendezvous_port,
-            authorized_keys: HashSet::new(),
-            peers: Default::default(),
-            device_key,
-        }));
-
         Ok(Self { listener, state })
     }
 
@@ -117,7 +95,7 @@ impl ControlServer {
         self.listener.local_addr().unwrap().port()
     }
 
-    pub fn state(&self) -> ControlServerState {
+    pub fn state(&self) -> ServiceState {
         self.state.clone()
     }
 
@@ -163,7 +141,7 @@ impl ControlServer {
         }
     }
 
-    pub async fn connect_to_peer(state: ControlServerState, socket_addr: SocketAddr) {
+    pub async fn connect_to_peer(state: ServiceState, socket_addr: SocketAddr) {
         async_std::task::spawn(async move {
             println!("Connecting to {}", socket_addr);
             let stream = TcpStream::connect(socket_addr).await.unwrap();
@@ -179,11 +157,15 @@ impl ControlServer {
     }
 }
 
+// This Mutex ensures that handshakes don't occur at the same time
+// If they did we could have more than one key per peer which is undersirable
+static HANDSHAKE_LOCK: async_std::sync::Mutex<()> = async_std::sync::Mutex::new(());
+
 struct ControlServerConnection<'a, T> {
     websocket: &'a mut WebSocketStream<T>,
-    state: ControlServerState,
+    state: ServiceState,
     peer_id: Option<String>,
-    shared_secret: Option<Vec<u8>>,
+    shared_secret: Option<SharedSecret>,
     cipher: Option<MessageCipher>,
     challenge: Option<Vec<u8>>,
     peer_key: Option<Vec<u8>>,
@@ -197,7 +179,7 @@ where
 {
     pub fn new(
         websocket: &'a mut WebSocketStream<T>,
-        state: ControlServerState,
+        state: ServiceState,
         peer_addr: SocketAddr,
     ) -> Self {
         Self {
@@ -294,36 +276,46 @@ where
                     return Err(ConnectionError::CryptoError);
                 };
 
-                let mut lock = self.state.write();
+                let peer_info = {
+                    // This block is needed to scope the lock for the await below
+                    let mut lock = self.state.write();
+                    if !lock.peers.contains_key(&peer_info.service_uuid) {
+                        if peer_info.service_uuid == lock.my_info.service_uuid {
+                            println!("Accidentally connected to myself");
+                            return Err(ConnectionError::PeerExists);
+                        }
 
-                if !lock.peers.contains_key(&peer_info.service_uuid) {
-                    if peer_info.service_uuid == lock.my_info.service_uuid {
-                        println!("Accidentally connected to myself");
-                        return Err(ConnectionError::PeerExists);
+                        let mut peer =
+                            PeerInfo::with_key_and_message(peer_key.clone(), peer_info.clone());
+                        peer.socket_addrs.insert(peer_addr);
+                        lock.peers.insert(peer_id.clone(), peer.clone());
+                        peer_info.clone()
+                    } else {
+                        println!("Peer already exists, checking key validity");
+                        let Some(mut peer) = lock.peers
+                            .get_mut(&peer_info.service_uuid) else {
+                            return Err(ConnectionError::InvalidState);
+                        };
+
+                        if peer.authenticated && !self.authenticated_peer {
+                            // Don't trust unauthenticated peer info if we already got successful auth
+                            // This means the peer uses different keys which can't be right
+                            return Err(ConnectionError::CryptoError);
+                        }
+
+                        // Update the info and ip addresses
+                        peer.update_message(peer_info.clone());
+                        peer.socket_addrs.insert(peer_addr);
+                        peer_info.clone()
                     }
+                };
 
-                    let mut peer =
-                        PeerInfo::with_key_and_message(peer_key.clone(), peer_info.clone());
-                    peer.socket_addrs.insert(peer_addr);
-
-                    lock.peers.insert(peer_id, peer);
-                } else {
-                    println!("Peer already exists, checking key validity");
-                    let Some(mut peer) = lock.peers
-                        .get_mut(&peer_info.service_uuid) else {
-                        return Err(ConnectionError::InvalidState);
-                    };
-
-                    if peer.authenticated && !self.authenticated_peer {
-                        // Don't trust unauthenticated peer info if we already got successful auth
-                        // This means the peer uses different keys which can't be right
-                        return Err(ConnectionError::CryptoError);
-                    }
-
-                    // Update the info and ip addresses
-                    peer.update_message(peer_info.clone());
-                    peer.socket_addrs.insert(peer_addr);
-                }
+                // Inform the service about peer update
+                let sender = self.state.read().service_sender.clone();
+                sender
+                    .send(ServiceMessage::PeerAddedUpdated { peer_id, peer_info })
+                    .await
+                    .map_err(|_| ConnectionError::InvalidState)?;
             }
             DecryptedMessage::AllocWormhole => {
                 if !self.authenticated_peer {
@@ -354,8 +346,17 @@ where
             DecryptedMessage::Remove => {
                 // Remove the peer from all discovery lists
                 if let Some(peer_id) = &self.peer_id {
+                    let old_id = peer_id.clone();
                     self.state.write().peers.remove(peer_id);
                     self.peer_id = None;
+
+                    // Inform the service about peer update
+                    let sender = self.state.read().service_sender.clone();
+                    sender
+                        .send(ServiceMessage::PeerRemoved { peer_id: old_id })
+                        .await
+                        .map_err(|_| ConnectionError::InvalidState)?;
+
                     return Err(ConnectionError::Closed(None));
                 }
             }
@@ -428,7 +429,12 @@ where
             };
 
             // Calculate SAS
-            let sas = Sas::new_hkdf_sha265(shared_secret, &my_pubkey, their_pubkey, is_client);
+            let sas = Sas::new_hkdf_sha265(
+                self.shared_secret.as_ref().unwrap().as_bytes(),
+                &my_pubkey,
+                their_pubkey,
+                is_client,
+            );
 
             println!(
                 "Please verify that these emoji match (y/n): {}",
@@ -475,6 +481,18 @@ where
     }
 
     pub async fn handshake(&mut self, is_client: bool) -> Result<(), ConnectionError> {
+        println!("Handshake");
+        // Keep this locked for the whole function
+        let handshake_lock = HANDSHAKE_LOCK.lock().await;
+
+        // Now that we have the lock we can make some assumptions:
+        // 1. No handshake will occur at the same time
+        // 2. As only the handshake sets the shared secret, this will be in a stable state:
+        //    We either have one, or we don't and need to do a key exchange
+
+        // Find out peer public key. Anyone could claim they are a specific peer, but we will verify
+        // this later after key exchange with the ed25519 certificate
+
         println!("Key exchange");
 
         // Key exchange
@@ -504,9 +522,9 @@ where
         // We use the secret to generate our cipher
         let their_ephemeral_pubkey = x25519_dalek::PublicKey::from(their_data_32);
         let shared_secret = my_ephemeral_secret.diffie_hellman(&their_ephemeral_pubkey);
-        self.shared_secret = Some(shared_secret.as_bytes().to_vec());
         let cipher = MessageCipher::from_secret(&shared_secret.to_bytes())
             .ok_or(ConnectionError::CryptoError)?;
+        self.shared_secret = Some(shared_secret);
         self.cipher = Some(cipher);
 
         // Now we have a cipher, let's continue encrypted
@@ -584,6 +602,9 @@ where
 
         println!("Verified the public key of peer");
 
+        // Make sure the handshake lock exists until the end of this function.
+        // drop consumes the lock, therefore it must exist up until this point.
+        drop(handshake_lock);
         Ok(())
     }
 

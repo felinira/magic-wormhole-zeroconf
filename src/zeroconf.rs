@@ -19,7 +19,6 @@ pub(crate) enum ZeroconfEvent {
 
 pub(crate) struct ZeroconfRunner {
     pub thread: std::thread::JoinHandle<Thread>,
-    pub receiver: async_channel::Receiver<ZeroconfEvent>,
 }
 
 pub(crate) struct ZeroconfService {
@@ -27,22 +26,18 @@ pub(crate) struct ZeroconfService {
 }
 
 impl ZeroconfService {
-    pub fn run(mailbox_port: u16, control_port: u16, service_uuid: uuid::Uuid) -> Self {
+    pub fn run(
+        control_port: u16,
+        service_uuid: String,
+        sender: async_channel::Sender<ZeroconfEvent>,
+    ) -> Self {
         println!("Running service");
-
-        let (sender, receiver) = async_channel::unbounded();
-
         let thread = std::thread::spawn(move || {
             let mut service =
                 MdnsService::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap(), control_port);
             let mut txt_record = TxtRecord::new();
 
-            txt_record
-                .insert("uuid", &service_uuid.to_string())
-                .unwrap();
-            txt_record
-                .insert("mailbox-port", &mailbox_port.to_string())
-                .unwrap();
+            txt_record.insert("uuid", &service_uuid).unwrap();
 
             service.set_registered_callback(Box::new(Self::on_service_registered));
             service.set_context(Box::new(sender));
@@ -57,7 +52,7 @@ impl ZeroconfService {
         });
 
         Self {
-            runner: ZeroconfRunner { thread, receiver },
+            runner: ZeroconfRunner { thread },
         }
     }
 
@@ -92,11 +87,8 @@ pub(crate) struct ZeroconfBrowser {
 }
 
 impl ZeroconfBrowser {
-    pub fn run() -> Self {
+    pub fn run(sender: async_channel::Sender<ZeroconfEvent>) -> Self {
         println!("Running listener");
-
-        let (sender, receiver) = async_channel::unbounded();
-
         let thread = std::thread::spawn(|| {
             let mut browser = MdnsBrowser::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap());
             browser.set_service_discovered_callback(Box::new(Self::on_service_discovered));
@@ -110,7 +102,7 @@ impl ZeroconfBrowser {
         });
 
         Self {
-            runner: ZeroconfRunner { thread, receiver },
+            runner: ZeroconfRunner { thread },
         }
     }
 

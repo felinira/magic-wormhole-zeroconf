@@ -63,6 +63,9 @@ pub enum CryptoAlgorithms {
 #[serde(rename_all = "kebab-case")]
 #[serde(tag = "type")]
 pub(crate) enum ControlMessage {
+    Welcome {
+        peer_id: String,
+    },
     KeyExchangeX25519 {
         algorithms: CryptoAlgorithms,
         public_key: Vec<u8>,
