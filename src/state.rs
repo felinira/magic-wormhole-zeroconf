@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub struct ServiceStateInner {
+    pub control_port: u16,
     pub rendezvous_port: u16,
     pub my_info: PeerInfoMessage,
     pub device_key: DeviceKeyPair,
@@ -27,6 +28,7 @@ impl ServiceState {
     ) -> Self {
         Self(Arc::new(RwLock::new(ServiceStateInner {
             my_info,
+            control_port: 0,
             rendezvous_port: 0,
             authorized_keys: HashSet::new(),
             peers: Default::default(),

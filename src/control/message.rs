@@ -64,6 +64,7 @@ pub enum CryptoAlgorithms {
 pub(crate) enum ControlMessage {
     Welcome {
         id: String,
+        control_port: u16,
     },
     KeyExchangeX25519 {
         algorithms: CryptoAlgorithms,

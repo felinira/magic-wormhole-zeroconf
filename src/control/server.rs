@@ -13,8 +13,9 @@ use futures::{SinkExt, StreamExt};
 use hkdf::Hkdf;
 use rand::{Rng, RngCore};
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 const APP_ID: &str = "app.drey.Warp.zeroconf0";
 
@@ -76,6 +77,9 @@ pub enum ControlServerMessage {
         peer_id: String,
         mailbox_addr: SocketAddr,
         code: String,
+    },
+    PeerRemoved {
+        peer_id: String,
     },
 }
 
@@ -167,7 +171,7 @@ impl ControlServer {
                     service_sender_clone,
                     false,
                     state,
-                    peer_addr,
+                    peer_addr.ip(),
                 );
                 if let Err(err) = connection.handle_connection().await {
                     match err {
@@ -208,10 +212,35 @@ impl ControlServer {
             let (mut ws, _response) = async_tungstenite::client_async(server_url, stream)
                 .await
                 .unwrap();
-            let mut connection =
-                ControlServerConnection::new(&mut ws, service_sender, true, state, socket_addr);
+            let mut connection = ControlServerConnection::new(
+                &mut ws,
+                service_sender,
+                true,
+                state,
+                socket_addr.ip(),
+            );
             connection.client_discovery_connection().await.unwrap();
         });
+    }
+
+    async fn connect_any(
+        socket_addrs: impl IntoIterator<Item = &SocketAddr>,
+    ) -> Option<(TcpStream, SocketAddr)> {
+        for addr in socket_addrs {
+            log::trace!("Try connect {}", addr);
+            let stream_res = TcpStream::connect(addr).await;
+            match stream_res {
+                Ok(stream) => {
+                    return Some((stream, *addr));
+                }
+                Err(err) => {
+                    log::warn!("Connection failed {}", err);
+                    // Ignore error and try different address
+                }
+            }
+        }
+
+        None
     }
 
     pub fn initiate_transfer(
@@ -225,36 +254,91 @@ impl ControlServer {
         };
 
         async_std::task::spawn(async move {
-            let mut connection = None;
-            let mut socket_addr = None;
-
-            for addr in peer_addrs {
-                let stream_res = TcpStream::connect(addr).await;
-                match stream_res {
-                    Ok(stream) => {
-                        connection = Some(stream);
-                        socket_addr = Some(addr);
-                        break;
-                    }
-                    Err(_err) => {
-                        // Ignore error and try different address
-                    }
-                }
-            }
-
-            if let (Some(socket_addr), Some(connection)) = (socket_addr, connection) {
+            if let Some((connection, socket_addr)) = Self::connect_any(&peer_addrs).await {
                 log::debug!("Connected");
                 let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr)).unwrap();
                 let (mut ws, _response) = async_tungstenite::client_async(server_url, connection)
                     .await
                     .unwrap();
-                let mut connection =
-                    ControlServerConnection::new(&mut ws, service_sender, true, state, socket_addr);
+                let mut connection = ControlServerConnection::new(
+                    &mut ws,
+                    service_sender,
+                    true,
+                    state,
+                    socket_addr.ip(),
+                );
                 connection.client_request_transfer().await.unwrap();
             }
         });
 
         Ok(())
+    }
+
+    async fn ping_peer(
+        peer_id: &str,
+        addrs: impl IntoIterator<Item = &SocketAddr>,
+        state: ServiceState,
+        service_sender: async_channel::Sender<ControlServerMessage>,
+    ) -> bool {
+        let Some((connection, socket_addr)) = Self::connect_any(addrs).await else {
+            return false;
+        };
+
+        log::trace!("Ping {}", socket_addr);
+
+        let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr)).unwrap();
+        let res = async_tungstenite::client_async(server_url, connection).await;
+
+        let Ok((mut ws, _response)) = res else {
+            return false;
+        };
+
+        let mut client =
+            ControlServerConnection::new(&mut ws, service_sender, true, state, socket_addr.ip());
+        let pong = client.client_ping(peer_id).await;
+        if pong {
+            log::trace!("Pong");
+        }
+
+        pong
+    }
+
+    pub async fn peer_ping_service(
+        state: ServiceState,
+        service_sender: async_channel::Sender<ControlServerMessage>,
+    ) {
+        let mut ping_id: u32 = 0;
+
+        loop {
+            // This will wake every 30 seconds and ping all peers to see if they are still there
+            async_io::Timer::after(Duration::from_secs(30)).await;
+            let mut peer_addrs = HashMap::new();
+            for (peer_id, peer) in &state.read().peers {
+                log::debug!("Addrs: {:?}", peer.socket_addrs);
+                peer_addrs.insert(peer_id.clone(), peer.socket_addrs.clone());
+            }
+
+            // Now we ping all the peers
+            for (peer_id, addrs) in peer_addrs {
+                log::debug!("Will try to ping {:?}", addrs);
+                let keep_peer =
+                    Self::ping_peer(&peer_id, &addrs, state.clone(), service_sender.clone()).await;
+
+                if !keep_peer {
+                    state.write().peers.remove(&peer_id);
+                    let res = service_sender
+                        .send(ControlServerMessage::PeerRemoved {
+                            peer_id: peer_id.clone(),
+                        })
+                        .await;
+                    if res.is_err() {
+                        log::error!("Error sending control server message");
+                    }
+                }
+            }
+
+            ping_id = ping_id.wrapping_add(1);
+        }
     }
 }
 
@@ -267,6 +351,7 @@ pub static AUTHENTICATION_LOCK: async_std::sync::Mutex<()> = async_std::sync::Mu
 
 struct ControlServerConnection<'a, T> {
     websocket: &'a mut WebSocketStream<T>,
+    peer_control_port: Option<u16>,
     service_sender: async_channel::Sender<ControlServerMessage>,
     is_client: bool,
     initiated_transfer: bool,
@@ -274,7 +359,7 @@ struct ControlServerConnection<'a, T> {
     peer_id: Option<String>,
     cipher: Option<MessageCipher>,
     challenge: Option<Vec<u8>>,
-    peer_addr: SocketAddr,
+    peer_ip: IpAddr,
 }
 
 impl<'a, T> ControlServerConnection<'a, T>
@@ -286,10 +371,11 @@ where
         service_sender: async_channel::Sender<ControlServerMessage>,
         is_client: bool,
         state: ServiceState,
-        peer_addr: SocketAddr,
+        peer_addr: IpAddr,
     ) -> Self {
         Self {
             websocket,
+            peer_control_port: None,
             service_sender,
             is_client,
             initiated_transfer: false,
@@ -297,7 +383,15 @@ where
             peer_id: None,
             cipher: None,
             challenge: None,
-            peer_addr,
+            peer_ip: peer_addr,
+        }
+    }
+
+    fn peer_control_socket_addr(&self) -> Option<SocketAddr> {
+        if let Some(port) = self.peer_control_port {
+            Some(SocketAddr::new(self.peer_ip, port))
+        } else {
+            None
         }
     }
 
@@ -364,6 +458,17 @@ where
 
         let msg = cipher.decrypt_message(&encrypted)?;
         log::trace!("Receive: {:?}", msg);
+
+        if let Some(peer_id) = &self.peer_id {
+            // We received an encrypted message from a known peer, we can add the address
+            // to the list of valid (verified) socket addrs
+            if let Some(peer) = self.state.write().peers.get_mut(peer_id) {
+                if let Some(socket_addr) = self.peer_control_socket_addr() {
+                    peer.socket_addrs.insert(socket_addr);
+                }
+            }
+        }
+
         Ok(msg)
     }
 
@@ -398,7 +503,6 @@ where
             }
             DecryptedMessage::Info(peer_info) => {
                 log::info!("Received peer info: {:?}", peer_info);
-                let peer_addr = self.peer_addr;
                 let peer_id = peer_info.service_uuid.clone();
                 self.peer_id = Some(peer_id.clone());
 
@@ -422,7 +526,6 @@ where
 
                         // Update the info and ip addresses
                         peer.update_message(peer_info.clone());
-                        peer.socket_addrs.insert(peer_addr);
                         peer_info.clone()
                     }
                 };
@@ -485,8 +588,7 @@ where
                     };
 
                     // We are the client, so we connect to the server mailbox
-                    let mut mailbox_addr = self.peer_addr;
-                    mailbox_addr.set_port(*port);
+                    let mailbox_addr = SocketAddr::new(self.peer_ip, *port);
 
                     self.service_sender
                         .send(ControlServerMessage::AllocatedWormhole {
@@ -731,16 +833,24 @@ where
         // Find out the peer id key. Anyone could claim they are a specific peer, but we will verify
         // this later after key exchange with the ed25519 certificate
         let my_id = self.state.read().my_info.service_uuid.clone();
-        self.send_msg(&ControlMessage::Welcome { id: my_id.clone() })
-            .await?;
+        let control_port = self.state.read().control_port;
+        self.send_msg(&ControlMessage::Welcome {
+            id: my_id.clone(),
+            control_port,
+        })
+        .await?;
         let msg = self.receive_msg().await?;
-        let peer_id = match msg {
-            ControlMessage::Welcome { id } => id,
+        let (peer_id, peer_control_port) = match msg {
+            ControlMessage::Welcome {
+                id,
+                control_port: peer_control_port,
+            } => (id, peer_control_port),
             _ => {
                 return Err(ConnectionError::InvalidState);
             }
         };
         self.peer_id = Some(peer_id.clone());
+        self.peer_control_port = Some(peer_control_port);
 
         // Now that we have the peer id we can check if we already made a handshake with this peer
         // or someone claiming to be this peer.
@@ -893,7 +1003,10 @@ where
                 return Err(ConnectionError::InvalidState);
             };
 
-            let peer = Peer::with_key(peer_key.clone(), sas_secret, cipher.clone());
+            let mut peer = Peer::with_key(peer_key.clone(), sas_secret, cipher.clone());
+            if let Some(socket_addr) = self.peer_control_socket_addr() {
+                peer.socket_addrs.insert(socket_addr);
+            }
             self.state.write().peers.insert(peer_id, peer);
         };
 
@@ -959,5 +1072,25 @@ where
         self.websocket.close(None).await?;
 
         Ok(())
+    }
+
+    pub async fn client_ping(&mut self, peer_id: &str) -> bool {
+        if let Ok(msg) = self.receive_msg().await {
+            match msg {
+                ControlMessage::Welcome {
+                    id,
+                    control_port: _,
+                } => {
+                    if peer_id == id {
+                        return true;
+                    }
+                }
+                _ => {
+                    return false;
+                }
+            }
+        }
+
+        false
     }
 }

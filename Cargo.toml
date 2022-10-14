@@ -11,6 +11,7 @@ magic-wormhole-mailbox = { path = "../magic-wormhole-mailbox-rs" }
 zeroconf = "0.10.5"
 async-channel = "1.7.1"
 async-std = { version = "1.12.0", features = [ "attributes" ] }
+async-io = "1.9.0"
 futures = "0.3.24"
 socket2 = "0.4.7"
 uuid = { version = "1.2.1", features = [ "v4" ] }

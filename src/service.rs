@@ -254,6 +254,9 @@ impl Service {
             ControlServerMessage::InitiateTransferPeerResult { peer_id, result } => {
                 ServiceMessage::InitiateTransferResult { peer_id, result }
             }
+            ControlServerMessage::PeerRemoved { peer_id } => {
+                ServiceMessage::PeerRemoved { peer_id }
+            }
         };
 
         self.service_sender
@@ -276,6 +279,7 @@ impl Service {
         let mut control_server = ControlServer::run(self.state.clone(), 0)
             .await
             .map_err(|err| ServiceError::InternalError(err.to_string()))?;
+        self.state.write().control_port = control_server.port();
         log::info!("Control: Listening on port: {}", control_server.port());
 
         let (zeroconf_sender, zeroconf_receiver) = async_channel::unbounded();
@@ -283,6 +287,14 @@ impl Service {
             ZeroconfService::spawn(control_server.port(), my_id, zeroconf_sender.clone());
         let zeroconf_browser = ZeroconfBrowser::spawn(zeroconf_sender);
         let request_receiver = self.request_receiver.take().unwrap();
+
+        let peer_ping_service = {
+            let state = self.state.clone();
+            let service_sender = self.control_server_sender.clone();
+            async_std::task::spawn(async move {
+                ControlServer::peer_ping_service(state, service_sender).await
+            })
+        };
 
         while !self.stop_handle.load(Ordering::Relaxed) {
             select! {
@@ -318,6 +330,7 @@ impl Service {
         zeroconf_browser.runner.stop();
         control_server.stop().await;
         rendezvous_server.stop().await;
+        peer_ping_service.cancel().await;
 
         Ok(())
     }
