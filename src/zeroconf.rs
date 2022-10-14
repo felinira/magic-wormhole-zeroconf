@@ -9,7 +9,7 @@ use zeroconf::{
     MdnsBrowser, MdnsService, ServiceDiscovery, ServiceRegistration, ServiceType, TxtRecord,
 };
 
-const SERVICE_NAME: &'static str = "app-drey-Warp-zeroconf-v0";
+const SERVICE_NAME: &str = "app-drey-Warp-zeroconf-v0";
 
 #[derive(Debug)]
 pub(crate) enum ZeroconfEvent {

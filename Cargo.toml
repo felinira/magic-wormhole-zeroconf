@@ -3,12 +3,12 @@ name = "magic-wormhole-zeroconf"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[example]]
+name = "cli"
 
 [dependencies]
 magic-wormhole-mailbox = { path = "../magic-wormhole-mailbox-rs" }
 zeroconf = "0.10.5"
-once_cell = "1.15.0"
 async-channel = "1.7.1"
 async-std = { version = "1.12.0", features = [ "attributes" ] }
 futures = "0.3.24"
@@ -30,8 +30,8 @@ rand = "0.8.5"
 hex = "0.4.3"
 x25519-dalek = "2.0.0-pre.1"
 chacha20poly1305 = "0.10.1"
-async-broadcast = "0.4.1"
 derive_more = "0.99.17"
-zeroize = "1.5.7"
-pretty_env_logger = "0.4.0"
 log = "0.4.17"
+
+[dev-dependencies]
+pretty_env_logger = "0.4.0"

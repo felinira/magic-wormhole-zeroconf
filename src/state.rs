@@ -1,8 +1,7 @@
 use crate::control::message::PeerInfoMessage;
 use crate::control::server::Peer;
 use crate::key::device::DeviceKeyPair;
-use crate::service::ServiceRequest;
-use crate::ServiceMessage;
+use crate::service::ServiceMessage;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

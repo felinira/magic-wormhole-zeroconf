@@ -1,24 +1,15 @@
 #![deny(unused_must_use)]
-#![warn(unused_crate_dependencies)]
-#![allow(dead_code)]
 
-use crate::key::device::DeviceKeyPair;
-use crate::service::{ServiceMessage, ServiceRequest};
 use futures::AsyncWriteExt;
+use magic_wormhole_zeroconf::key::device::DeviceKeyPair;
+use magic_wormhole_zeroconf::service::{ServiceMessage, ServiceRequest};
 use std::collections::HashSet;
-
-mod control;
-mod key;
-mod network;
-mod service;
-mod state;
-mod zeroconf;
 
 #[async_std::main]
 async fn main() {
     pretty_env_logger::init();
     let (request_sender, service_receiver, mut service) =
-        service::Service::new(DeviceKeyPair::generate_new_ed25519());
+        magic_wormhole_zeroconf::service::Service::new(DeviceKeyPair::generate_new_ed25519());
     async_std::task::spawn(async move {
         service.run().await.unwrap();
     });
@@ -57,7 +48,7 @@ async fn main() {
             }
             ServiceMessage::CompareEmoji {
                 peer_id,
-                emoji,
+                emoji: _,
                 verbose_emoji,
                 result_fn,
             } => {
@@ -79,7 +70,7 @@ async fn main() {
             }
             ServiceMessage::AllocatedWormhole {
                 send,
-                peer_id,
+                peer_id: _,
                 peer_addr,
                 code,
             } => {
@@ -108,7 +99,7 @@ async fn ask_y_n(question: &str) -> bool {
             .await
             .unwrap();
         let input = user_input.to_lowercase();
-        let input = input.trim().clone();
+        let input = input.trim();
         if input == "y" {
             return true;
         } else if input == "n" {

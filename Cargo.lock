@@ -1067,7 +1067,6 @@ dependencies = [
 name = "magic-wormhole-zeroconf"
 version = "0.1.0"
 dependencies = [
- "async-broadcast",
  "async-channel",
  "async-std",
  "async-tungstenite",
@@ -1079,7 +1078,6 @@ dependencies = [
  "hkdf",
  "log",
  "magic-wormhole-mailbox",
- "once_cell",
  "parking_lot",
  "pretty_env_logger",
  "rand 0.7.3",
@@ -1095,7 +1093,6 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "zeroconf",
- "zeroize",
 ]
 
 [[package]]

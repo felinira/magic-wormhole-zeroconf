@@ -4,8 +4,8 @@ use crate::control::message::{
 use crate::key::device::DevicePublicKey;
 use crate::key::message::MessageCipher;
 use crate::key::sas::Sas;
+use crate::service::ServiceMessage;
 use crate::state::ServiceState;
-use crate::ServiceMessage;
 use async_std::net::TcpStream;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
@@ -16,7 +16,7 @@ use sha2::Sha256;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-const APP_ID: &'static str = "app.drey.Warp.zeroconf0";
+const APP_ID: &str = "app.drey.Warp.zeroconf0";
 
 #[derive(Debug, thiserror::Error)]
 #[must_use]
@@ -204,9 +204,8 @@ impl ControlServer {
         async_std::task::spawn(async move {
             log::info!("Connecting to {}", socket_addr);
             let stream = TcpStream::connect(socket_addr).await.unwrap();
-            let server_url =
-                url::Url::parse(&format!("ws://{}/v1", socket_addr.to_string())).unwrap();
-            let (mut ws, response) = async_tungstenite::client_async(server_url, stream)
+            let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr)).unwrap();
+            let (mut ws, _response) = async_tungstenite::client_async(server_url, stream)
                 .await
                 .unwrap();
             let mut connection =
@@ -237,7 +236,7 @@ impl ControlServer {
                         socket_addr = Some(addr);
                         break;
                     }
-                    Err(err) => {
+                    Err(_err) => {
                         // Ignore error and try different address
                     }
                 }
@@ -246,7 +245,7 @@ impl ControlServer {
             if let (Some(socket_addr), Some(connection)) = (socket_addr, connection) {
                 log::debug!("Connected");
                 let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr)).unwrap();
-                let (mut ws, response) = async_tungstenite::client_async(server_url, connection)
+                let (mut ws, _response) = async_tungstenite::client_async(server_url, connection)
                     .await
                     .unwrap();
                 let mut connection =
@@ -399,7 +398,7 @@ where
             }
             DecryptedMessage::Info(peer_info) => {
                 log::info!("Received peer info: {:?}", peer_info);
-                let peer_addr = self.peer_addr.clone();
+                let peer_addr = self.peer_addr;
                 let peer_id = peer_info.service_uuid.clone();
                 self.peer_id = Some(peer_id.clone());
 
@@ -416,7 +415,7 @@ where
                         return Err(ConnectionError::InvalidState);
                     } else {
                         log::debug!("Peer already exists, checking key validity");
-                        let Some(mut peer) = lock.peers
+                        let Some(peer) = lock.peers
                             .get_mut(&peer_info.service_uuid) else {
                             return Err(ConnectionError::InvalidState);
                         };
@@ -486,9 +485,8 @@ where
                     };
 
                     // We are the client, so we connect to the server mailbox
-                    let port = self.state.read().rendezvous_port;
-                    let mut mailbox_addr = self.peer_addr.clone();
-                    mailbox_addr.set_port(port);
+                    let mut mailbox_addr = self.peer_addr;
+                    mailbox_addr.set_port(*port);
 
                     self.service_sender
                         .send(ControlServerMessage::AllocatedWormhole {
@@ -572,7 +570,7 @@ where
     }
 
     pub async fn handle_connection(&mut self) -> Result<(), ConnectionError> {
-        self.handshake(false).await?;
+        self.handshake().await?;
 
         while !self.websocket.is_terminated() {
             let msg = self.receive_encrypted_msg().await?;
@@ -628,11 +626,9 @@ where
                 DecryptedMessage::AuthenticationResult(success) => {
                     if success {
                         // We agree that we don't need verification
-                        self.state
-                            .write()
-                            .peers
-                            .get_mut(&peer_id)
-                            .map(|peer| peer.authenticated = true);
+                        if let Some(peer) = self.state.write().peers.get_mut(&peer_id) {
+                            peer.authenticated = true
+                        }
                         do_user_auth = false;
                     } else {
                         log::info!("Authentication failed");
@@ -663,7 +659,7 @@ where
 
             let (result_sender, result_receiver) = async_channel::unbounded();
             let result_fn = move |result| {
-                result_sender.send_blocking(true).unwrap();
+                result_sender.send_blocking(result).unwrap();
             };
 
             self.service_sender
@@ -690,11 +686,9 @@ where
                         // They want to authenticate as well
                     }
                     DecryptedMessage::AuthenticationResult(success) => {
-                        self.state
-                            .write()
-                            .peers
-                            .get_mut(&peer_id)
-                            .map(|peer| peer.authenticated = success);
+                        if let Some(peer) = self.state.write().peers.get_mut(&peer_id) {
+                            peer.authenticated = success;
+                        }
                         self.service_sender
                             .send(ControlServerMessage::CompareEmojiPeerResult {
                                 peer_id: peer_id.clone(),
@@ -724,7 +718,7 @@ where
         Ok(())
     }
 
-    pub async fn handshake(&mut self, is_client: bool) -> Result<(), ConnectionError> {
+    pub async fn handshake(&mut self) -> Result<(), ConnectionError> {
         log::info!("Handshake");
         // Keep this locked for the whole function
         let handshake_lock = HANDSHAKE_LOCK.lock().await;
@@ -873,7 +867,7 @@ where
                         // Check if the signature matches the challenge + key
                         let mut data = challenge.clone();
                         data.extend_from_slice(&public_key);
-                        data.extend_from_slice(&peer_id.as_bytes());
+                        data.extend_from_slice(peer_id.as_bytes());
                         let key = DevicePublicKey::from_data(&public_key)
                             .ok_or(ConnectionError::CryptoError)?;
                         if !key.verify(&data, &signature) {
@@ -899,7 +893,7 @@ where
                 return Err(ConnectionError::InvalidState);
             };
 
-            let mut peer = Peer::with_key(peer_key.clone(), sas_secret, cipher.clone());
+            let peer = Peer::with_key(peer_key.clone(), sas_secret, cipher.clone());
             self.state.write().peers.insert(peer_id, peer);
         };
 
@@ -911,7 +905,7 @@ where
 
     pub async fn client_discovery_connection(&mut self) -> Result<(), ConnectionError> {
         log::info!("Client connection");
-        self.handshake(true).await?;
+        self.handshake().await?;
 
         self.send_encrypted_msg(DecryptedMessage::RequestInfo)
             .await?;
@@ -923,7 +917,7 @@ where
     }
 
     pub async fn client_request_transfer(&mut self) -> Result<(), ConnectionError> {
-        self.handshake(true).await?;
+        self.handshake().await?;
 
         let Some(peer_id) = self.peer_id.clone() else {
             return Err(ConnectionError::InvalidState);

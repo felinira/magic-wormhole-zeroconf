@@ -1,6 +1,4 @@
 use serde_derive::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::net::SocketAddr;
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfoMessage {

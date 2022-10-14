@@ -1,19 +1,15 @@
 use crate::control::message::PeerInfoMessage;
-use crate::control::server::{ConnectionError, ControlServer, ControlServerMessage, Peer};
-use crate::key;
+use crate::control::server::{ConnectionError, ControlServer, ControlServerMessage};
 use crate::key::device::DeviceKeyPair;
 use crate::state::ServiceState;
 use crate::zeroconf::{ZeroconfBrowser, ZeroconfEvent, ZeroconfService, ZeroconfServiceDiscovery};
-use async_tungstenite::tungstenite::protocol::frame::coding::OpCode::Control;
 use futures::{select, FutureExt};
-use magic_wormhole_mailbox::{rendezvous_server, RendezvousServer};
+use magic_wormhole_mailbox::RendezvousServer;
 use std::collections::HashSet;
 use std::net::{AddrParseError, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use sysinfo::SystemExt;
-use zeroconf::prelude::*;
-use zeroconf::ServiceDiscovery;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -120,7 +116,7 @@ impl Service {
         let system_info = sysinfo::System::new();
 
         PeerInfoMessage::new(
-            system_info.host_name().unwrap_or("?".to_string()),
+            system_info.host_name().unwrap_or_else(|| "?".to_string()),
             my_id,
             None,
             None,
@@ -150,7 +146,7 @@ impl Service {
         let control_port = discovery.port;
 
         // Connect to the control port
-        let socket_addr = if discovery.address.contains(":") {
+        let socket_addr = if discovery.address.contains(':') {
             // This is an IPv6 address
             // TODO: Is there a better way?
             format!("[{}]:{}", discovery.address, control_port)
@@ -283,9 +279,9 @@ impl Service {
         log::info!("Control: Listening on port: {}", control_server.port());
 
         let (zeroconf_sender, zeroconf_receiver) = async_channel::unbounded();
-        let mut zeroconf_service =
+        let zeroconf_service =
             ZeroconfService::spawn(control_server.port(), my_id, zeroconf_sender.clone());
-        let mut zeroconf_browser = ZeroconfBrowser::spawn(zeroconf_sender);
+        let zeroconf_browser = ZeroconfBrowser::spawn(zeroconf_sender);
         let request_receiver = self.request_receiver.take().unwrap();
 
         while !self.stop_handle.load(Ordering::Relaxed) {

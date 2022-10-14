@@ -1,6 +1,5 @@
 /// The verification flow is based on the matrix key verification flow as detailed
 /// [here](https://matrix.org/docs/guides/implementing-more-advanced-e-2-ee-features-such-as-cross-signing)
-use crate::control::message::PeerInfoMessage;
 use hkdf::Hkdf;
 use sha2::Digest;
 use sha2::Sha256;
@@ -54,7 +53,7 @@ impl Sas {
     }
 
     fn generate_hkdf(input: &str) -> [u8; 42] {
-        let hk = Hkdf::<Sha256>::new(None, &input.as_bytes());
+        let hk = Hkdf::<Sha256>::new(None, input.as_bytes());
 
         // 42 bytes for sha265
         let mut okm = [0u8; 42];
