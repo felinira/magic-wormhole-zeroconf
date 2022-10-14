@@ -1,6 +1,6 @@
 use serde_derive::{Deserialize, Serialize};
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerInfoMessage {
     pub machine_name: String,
     pub service_uuid: String,

@@ -6,6 +6,7 @@ use crate::key::message::MessageCipher;
 use crate::key::sas::Sas;
 use crate::service::ServiceMessage;
 use crate::state::ServiceState;
+use async_std::future::timeout;
 use async_std::net::TcpStream;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
@@ -53,6 +54,12 @@ pub enum ConnectionError {
     CryptoError,
 }
 
+#[derive(Debug)]
+pub enum ControlServerErrorKind {
+    Timeout,
+    ClientError,
+}
+
 pub enum ControlServerMessage {
     CompareEmoji {
         peer_id: String,
@@ -71,6 +78,7 @@ pub enum ControlServerMessage {
     InitiateTransferPeerResult {
         peer_id: String,
         result: bool,
+        error: Option<ControlServerErrorKind>,
     },
     AllocatedWormhole {
         send: bool,
@@ -106,8 +114,14 @@ impl Peer {
         }
     }
 
-    pub fn update_message(&mut self, message: PeerInfoMessage) {
-        self.message = Some(message);
+    pub fn update_message(&mut self, message: PeerInfoMessage) -> bool {
+        let message = Some(message);
+        if self.message != message {
+            self.message = message;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -260,6 +274,7 @@ impl ControlServer {
                 let (mut ws, _response) = async_tungstenite::client_async(server_url, connection)
                     .await
                     .unwrap();
+                let service_sender_c = service_sender.clone();
                 let mut connection = ControlServerConnection::new(
                     &mut ws,
                     service_sender,
@@ -267,7 +282,43 @@ impl ControlServer {
                     state,
                     socket_addr.ip(),
                 );
-                connection.client_request_transfer().await.unwrap();
+
+                let timeout_res = timeout(
+                    Duration::from_secs(60 * 5),
+                    connection.client_request_transfer(),
+                )
+                .await;
+                match timeout_res {
+                    Ok(res) => {
+                        match res {
+                            Ok(_) => {
+                                // Really ok
+                            }
+                            Err(err) => {
+                                log::error!("Error initiating transfer: {}", err);
+
+                                let _ = service_sender_c
+                                    .send(ControlServerMessage::InitiateTransferPeerResult {
+                                        peer_id,
+                                        result: false,
+                                        error: Some(ControlServerErrorKind::ClientError),
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(t_err) => {
+                        log::error!("Timeout initiating transfer: {}", t_err);
+
+                        let _ = service_sender_c
+                            .send(ControlServerMessage::InitiateTransferPeerResult {
+                                peer_id,
+                                result: false,
+                                error: Some(ControlServerErrorKind::Timeout),
+                            })
+                            .await;
+                    }
+                }
             }
         });
 
@@ -314,13 +365,11 @@ impl ControlServer {
             async_io::Timer::after(Duration::from_secs(30)).await;
             let mut peer_addrs = HashMap::new();
             for (peer_id, peer) in &state.read().peers {
-                log::debug!("Addrs: {:?}", peer.socket_addrs);
                 peer_addrs.insert(peer_id.clone(), peer.socket_addrs.clone());
             }
 
             // Now we ping all the peers
             for (peer_id, addrs) in peer_addrs {
-                log::debug!("Will try to ping {:?}", addrs);
                 let keep_peer =
                     Self::ping_peer(&peer_id, &addrs, state.clone(), service_sender.clone()).await;
 
@@ -506,7 +555,7 @@ where
                 let peer_id = peer_info.service_uuid.clone();
                 self.peer_id = Some(peer_id.clone());
 
-                let peer_info = {
+                let (updated, peer_info) = {
                     // This block is needed to scope the lock for the await below
                     let mut lock = self.state.write();
                     if !lock.peers.contains_key(&peer_info.service_uuid) {
@@ -525,17 +574,19 @@ where
                         };
 
                         // Update the info and ip addresses
-                        peer.update_message(peer_info.clone());
-                        peer_info.clone()
+                        let updated = peer.update_message(peer_info.clone());
+                        (updated, peer_info.clone())
                     }
                 };
 
-                // Inform the service about peer update
-                let sender = self.state.read().service_sender.clone();
-                sender
-                    .send(ServiceMessage::PeerAddedUpdated { peer_id, peer_info })
-                    .await
-                    .map_err(|_| ConnectionError::InvalidState)?;
+                // Inform the service about peer update if the peer message has changed
+                if updated {
+                    let sender = self.state.read().service_sender.clone();
+                    sender
+                        .send(ServiceMessage::PeerAddedUpdated { peer_id, peer_info })
+                        .await
+                        .map_err(|_| ConnectionError::InvalidState)?;
+                }
             }
             DecryptedMessage::AllocWormhole => {
                 if !authenticated_peer {
@@ -1049,6 +1100,7 @@ where
                         .send(ControlServerMessage::InitiateTransferPeerResult {
                             peer_id,
                             result: false,
+                            error: None,
                         })
                         .await
                         .map_err(|_| ConnectionError::InvalidState)?;

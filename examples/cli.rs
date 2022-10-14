@@ -77,8 +77,14 @@ async fn main() {
                 let role = if send { "sender" } else { "receiver" };
                 println!("Will connect to wormhole {code} as {role} on server {peer_addr}");
             }
-            ServiceMessage::InitiateTransferResult { peer_id, result } => {
-                if result {
+            ServiceMessage::InitiateTransferResult {
+                peer_id,
+                result,
+                error,
+            } => {
+                if let Some(error) = error {
+                    println!("Error while requesting transfer: {:?}", error)
+                } else if result {
                     println!("Peer {} has allowed our transfer request", peer_id)
                 } else {
                     println!("Peer {} has denied our transfer request", peer_id)

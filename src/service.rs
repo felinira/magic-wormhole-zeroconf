@@ -1,5 +1,7 @@
 use crate::control::message::PeerInfoMessage;
-use crate::control::server::{ConnectionError, ControlServer, ControlServerMessage};
+use crate::control::server::{
+    ConnectionError, ControlServer, ControlServerErrorKind, ControlServerMessage,
+};
 use crate::key::device::DeviceKeyPair;
 use crate::state::ServiceState;
 use crate::zeroconf::{ZeroconfBrowser, ZeroconfEvent, ZeroconfService, ZeroconfServiceDiscovery};
@@ -41,6 +43,7 @@ pub enum ServiceMessage {
     InitiateTransferResult {
         peer_id: String,
         result: bool,
+        error: Option<ControlServerErrorKind>,
     },
     CompareEmoji {
         peer_id: String,
@@ -251,9 +254,15 @@ impl Service {
             ControlServerMessage::RequestInitiateTransfer { peer_id, result_fn } => {
                 ServiceMessage::RequestInitiateTransfer { peer_id, result_fn }
             }
-            ControlServerMessage::InitiateTransferPeerResult { peer_id, result } => {
-                ServiceMessage::InitiateTransferResult { peer_id, result }
-            }
+            ControlServerMessage::InitiateTransferPeerResult {
+                peer_id,
+                result,
+                error,
+            } => ServiceMessage::InitiateTransferResult {
+                peer_id,
+                result,
+                error,
+            },
             ControlServerMessage::PeerRemoved { peer_id } => {
                 ServiceMessage::PeerRemoved { peer_id }
             }
