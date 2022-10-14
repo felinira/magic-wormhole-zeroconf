@@ -9,10 +9,9 @@ pub struct MessageCipher {
 }
 
 impl MessageCipher {
-    pub fn from_secret(secret: &[u8]) -> Option<Self> {
-        let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(secret).ok()?;
-
-        Some(Self { cipher })
+    pub fn from_secret(secret: &[u8]) -> Self {
+        let cipher = chacha20poly1305::ChaCha20Poly1305::new_from_slice(secret).unwrap();
+        Self { cipher }
     }
 
     pub fn from_cipher(cipher: chacha20poly1305::ChaCha20Poly1305) -> Self {

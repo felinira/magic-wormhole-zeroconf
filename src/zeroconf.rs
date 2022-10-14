@@ -67,7 +67,7 @@ impl ZeroconfService {
         service_uuid: String,
         sender: async_channel::Sender<ZeroconfEvent>,
     ) -> Self {
-        println!("Running service");
+        log::info!("Running zeroconf service");
         let stop_handle: Arc<AtomicBool> = Arc::default();
         let stop_handle_thread = stop_handle.clone();
         let thread = std::thread::spawn(move || {
@@ -108,13 +108,13 @@ impl ZeroconfService {
 
         match result {
             Ok(service) => {
-                println!("Service registered: {:?}", service);
+                log::debug!("Service registered: {:?}", service);
                 sender
                     .send_blocking(ZeroconfEvent::ServiceRegistered)
                     .unwrap();
             }
             Err(error) => {
-                println!("Error registering service: {}", error);
+                log::error!("Error registering service: {}", error);
                 sender.send_blocking(ZeroconfEvent::Error(error)).unwrap();
             }
         }
@@ -127,7 +127,7 @@ pub(crate) struct ZeroconfBrowser {
 
 impl ZeroconfBrowser {
     pub fn spawn(sender: async_channel::Sender<ZeroconfEvent>) -> Self {
-        println!("Running listener");
+        log::info!("Running zeroconf listener");
         let stop_handle: Arc<AtomicBool> = Arc::default();
         let stop_handle_thread = stop_handle.clone();
         let thread = std::thread::spawn(move || {
@@ -173,19 +173,14 @@ impl ZeroconfBrowser {
                 if !txt.contains_key("uuid") {
                     return;
                 }
-                /*
-                                if txt.get("uuid") == Some(self.uuid.to_string()) {
-                                    println!("Discovered myself");
-                                    return;
-                                }
-                */
-                println!("Service discovered: {:?}", service);
+
+                log::debug!("Service discovered: {:?}", service);
                 sender
                     .send_blocking(ZeroconfEvent::ServiceDiscovered(service.into()))
                     .unwrap();
             }
             Err(err) => {
-                println!("Error: {}", err);
+                log::error!("Error: {}", err);
             }
         }
     }

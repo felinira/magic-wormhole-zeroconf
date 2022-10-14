@@ -38,7 +38,7 @@ impl Sas {
             shared_key_hash, combined_sas_info
         );
 
-        println!("sas string: {}", sas_string);
+        log::debug!("SAS string: {}", sas_string);
 
         let hkdf_sha265 = Self::generate_hkdf(&sas_string);
 

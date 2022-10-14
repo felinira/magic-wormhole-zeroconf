@@ -8,7 +8,7 @@ use async_tungstenite::tungstenite::protocol::frame::coding::OpCode::Control;
 use futures::{select, FutureExt};
 use magic_wormhole_mailbox::{rendezvous_server, RendezvousServer};
 use std::collections::HashSet;
-use std::net::AddrParseError;
+use std::net::{AddrParseError, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use sysinfo::SystemExt;
@@ -40,6 +40,11 @@ pub enum ServiceMessage {
     },
     RequestInitiateTransfer {
         peer_id: String,
+        result_fn: Box<dyn FnOnce(bool) + Send>,
+    },
+    InitiateTransferResult {
+        peer_id: String,
+        result: bool,
     },
     CompareEmoji {
         peer_id: String,
@@ -50,6 +55,12 @@ pub enum ServiceMessage {
     CompareEmojiPeerResult {
         peer_id: String,
         result: bool,
+    },
+    AllocatedWormhole {
+        send: bool,
+        peer_id: String,
+        peer_addr: SocketAddr,
+        code: String,
     },
 }
 
@@ -127,12 +138,12 @@ impl Service {
         };
 
         let Some(peer_id) = txt.get("uuid") else {
-            println!("No uuid specified in mDNS txt record");
+            log::warn!("No uuid specified in mDNS txt record");
             return Ok(());
         };
 
         if peer_id == my_id {
-            println!("Discovered myself");
+            log::debug!("Discovered myself");
             return Ok(());
         }
 
@@ -215,37 +226,51 @@ impl Service {
         &mut self,
         msg: ControlServerMessage,
     ) -> Result<(), ServiceError> {
-        match msg {
+        let service_msg = match msg {
             ControlServerMessage::CompareEmoji {
                 peer_id,
                 emoji,
                 verbose_emoji,
                 result_fn,
-            } => {
-                self.service_sender
-                    .send(ServiceMessage::CompareEmoji {
-                        peer_id,
-                        emoji,
-                        verbose_emoji,
-                        result_fn,
-                    })
-                    .await
-                    .map_err(|_| ServiceError::InternalError("Channel closed".to_string()))?;
-            }
+            } => ServiceMessage::CompareEmoji {
+                peer_id,
+                emoji,
+                verbose_emoji,
+                result_fn,
+            },
             ControlServerMessage::CompareEmojiPeerResult { peer_id, result } => {
-                self.service_sender
-                    .send(ServiceMessage::CompareEmojiPeerResult { peer_id, result })
-                    .await
-                    .map_err(|_| ServiceError::InternalError("Channel closed".to_string()))?;
+                ServiceMessage::CompareEmojiPeerResult { peer_id, result }
             }
-        }
+            ControlServerMessage::AllocatedWormhole {
+                send,
+                peer_id,
+                mailbox_addr: peer_addr,
+                code,
+            } => ServiceMessage::AllocatedWormhole {
+                send,
+                peer_id,
+                peer_addr,
+                code,
+            },
+            ControlServerMessage::RequestInitiateTransfer { peer_id, result_fn } => {
+                ServiceMessage::RequestInitiateTransfer { peer_id, result_fn }
+            }
+            ControlServerMessage::InitiateTransferPeerResult { peer_id, result } => {
+                ServiceMessage::InitiateTransferResult { peer_id, result }
+            }
+        };
+
+        self.service_sender
+            .send(service_msg)
+            .await
+            .map_err(|_| ServiceError::InternalError("Channel closed".to_string()))?;
 
         Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
         let mut rendezvous_server = RendezvousServer::run(0).await.unwrap();
-        println!(
+        log::info!(
             "Rendezvous: Listening on port: {}",
             rendezvous_server.port()
         );
@@ -255,7 +280,7 @@ impl Service {
         let mut control_server = ControlServer::run(self.state.clone(), 0)
             .await
             .map_err(|err| ServiceError::InternalError(err.to_string()))?;
-        println!("Control: Listening on port: {}", control_server.port());
+        log::info!("Control: Listening on port: {}", control_server.port());
 
         let (zeroconf_sender, zeroconf_receiver) = async_channel::unbounded();
         let mut zeroconf_service =
@@ -264,19 +289,18 @@ impl Service {
         let request_receiver = self.request_receiver.take().unwrap();
 
         while !self.stop_handle.load(Ordering::Relaxed) {
-            println!("Listening for events");
             select! {
                 msg_res = zeroconf_receiver.recv().fuse() => if let Ok(msg) = &msg_res {
                     match msg {
                         ZeroconfEvent::ServiceDiscovered(discovery) => {
-                            println!("Service discovered event");
+                            log::debug!("Service discovered event");
                             self.handle_service_discovered(discovery).await?;
                         },
                         ZeroconfEvent::ServiceRegistered => {
                             self.handle_service_registered().await?;
                         },
                         ZeroconfEvent::Error(err) => {
-                            println!("Zeroconf error: {:?}", err);
+                            log::error!("Zeroconf error: {:?}", err);
                         }
                     }
                 },
@@ -284,9 +308,9 @@ impl Service {
                     self.handle_request(msg).await?;
                 },
                 () = Box::pin(rendezvous_server.wait_for_connection()).fuse() =>
-                    println!("Rendezvous server stopped"),
+                    log::error!("Rendezvous server stopped"),
                 () = Box::pin(control_server.wait_for_connection(self.control_server_sender.clone())).fuse() =>
-                    println!("Control server stopped"),
+                    log::error!("Control server stopped"),
                 msg_res = self.control_server_receiver.recv().fuse() => if let Ok(msg) = msg_res {
                     self.handle_control_server_msg(msg).await?;
                 }

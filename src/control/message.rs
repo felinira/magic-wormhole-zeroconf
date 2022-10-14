@@ -39,6 +39,7 @@ pub enum DecryptedMessage {
     Info(PeerInfoMessage),
     AllocWormhole,
     InitiateTransfer,
+    InitiateTransferResult(bool),
     UserAuthenticate,
     AuthenticationResult(bool),
     Wormhole {
