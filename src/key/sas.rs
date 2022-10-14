@@ -96,8 +96,6 @@ impl Sas {
             }
         }
 
-        println!("{verbose_string}");
-
         (output_string, verbose_string)
     }
 }

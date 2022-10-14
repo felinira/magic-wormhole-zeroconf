@@ -15,8 +15,6 @@ use rand::RngCore;
 use sha2::Sha256;
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use x25519_dalek::SharedSecret;
-use zeroize::Zeroizing;
 
 const APP_ID: &'static str = "app.drey.Warp.zeroconf0";
 
@@ -52,6 +50,19 @@ pub enum ConnectionError {
     PeerExists,
     #[error("A cryptographic constraint was not held")]
     CryptoError,
+}
+
+pub enum ControlServerMessage {
+    CompareEmoji {
+        peer_id: String,
+        emoji: String,
+        verbose_emoji: String,
+        result_fn: Box<dyn FnOnce(bool) + Send>,
+    },
+    CompareEmojiPeerResult {
+        peer_id: String,
+        result: bool,
+    },
 }
 
 #[derive(Clone)]
@@ -98,6 +109,10 @@ impl ControlServer {
         Ok(Self { listener, state })
     }
 
+    pub async fn stop(self) {
+        // This is the same as drop(), but might be augmented for later expansion
+    }
+
     pub fn port(&self) -> u16 {
         self.listener.local_addr().unwrap().port()
     }
@@ -106,7 +121,10 @@ impl ControlServer {
         self.state.clone()
     }
 
-    pub async fn wait_for_connection(&mut self) {
+    pub async fn wait_for_connection(
+        &mut self,
+        service_sender: async_channel::Sender<ControlServerMessage>,
+    ) {
         while let Some(stream) = self.listener.incoming().next().await {
             println!("Connection!");
             let Ok(stream) = stream else {
@@ -119,6 +137,8 @@ impl ControlServer {
                 continue;
             };
 
+            let service_sender_clone = service_sender.clone();
+
             async_std::task::spawn(async move {
                 let mut ws = match async_tungstenite::accept_async(stream).await {
                     Ok(ws) => ws,
@@ -128,7 +148,13 @@ impl ControlServer {
                     }
                 };
 
-                let mut connection = ControlServerConnection::new(&mut ws, false, state, peer_addr);
+                let mut connection = ControlServerConnection::new(
+                    &mut ws,
+                    service_sender_clone,
+                    false,
+                    state,
+                    peer_addr,
+                );
                 if let Err(err) = connection.handle_connection().await {
                     println!("Connection error: {}", err);
                 }
@@ -148,7 +174,11 @@ impl ControlServer {
         }
     }
 
-    pub async fn connect_to_peer(state: ServiceState, socket_addr: SocketAddr) {
+    pub async fn peer_discovery_client(
+        state: ServiceState,
+        service_sender: async_channel::Sender<ControlServerMessage>,
+        socket_addr: SocketAddr,
+    ) {
         async_std::task::spawn(async move {
             println!("Connecting to {}", socket_addr);
             let stream = TcpStream::connect(socket_addr).await.unwrap();
@@ -158,18 +188,62 @@ impl ControlServer {
             let (mut ws, response) = async_tungstenite::client_async(server_url, stream)
                 .await
                 .unwrap();
-            let connection = ControlServerConnection::new(&mut ws, true, state, socket_addr);
-            connection.client_connection().await.unwrap();
+            let mut connection =
+                ControlServerConnection::new(&mut ws, service_sender, true, state, socket_addr);
+            connection.client_discovery_connection().await.unwrap();
         });
+    }
+
+    pub fn initiate_transfer(
+        state: ServiceState,
+        peer_id: String,
+        service_sender: async_channel::Sender<ControlServerMessage>,
+    ) -> Result<(), ConnectionError> {
+        println!("Connecting to {}", peer_id);
+        let Some(peer_addrs) = state.read().peers.get(&peer_id).map(|peer| peer.socket_addrs.clone()) else {
+            return Err(ConnectionError::InvalidState);
+        };
+
+        async_std::task::spawn(async move {
+            let mut connection = None;
+            let mut socket_addr = None;
+
+            for addr in peer_addrs {
+                let stream_res = TcpStream::connect(addr).await;
+                match stream_res {
+                    Ok(stream) => {
+                        connection = Some(stream);
+                        socket_addr = Some(addr);
+                    }
+                    Err(err) => {
+                        // Ignore error and try different address
+                    }
+                }
+            }
+
+            if let (Some(socket_addr), Some(connection)) = (socket_addr, connection) {
+                println!("Connected");
+                let server_url = url::Url::parse(&format!("ws://{}/v1", socket_addr)).unwrap();
+                let (mut ws, response) = async_tungstenite::client_async(server_url, connection)
+                    .await
+                    .unwrap();
+                let mut connection =
+                    ControlServerConnection::new(&mut ws, service_sender, true, state, socket_addr);
+                connection.client_request_transfer().await.unwrap();
+            }
+        });
+
+        Ok(())
     }
 }
 
 // This Mutex ensures that handshakes don't occur at the same time
-// If they did we could have more than one key per peer which is undersirable
-static HANDSHAKE_LOCK: async_std::sync::Mutex<()> = async_std::sync::Mutex::new(());
+// If they did we could have more than one key per peer which is undesirable
+pub static HANDSHAKE_LOCK: async_std::sync::Mutex<()> = async_std::sync::Mutex::new(());
 
 struct ControlServerConnection<'a, T> {
     websocket: &'a mut WebSocketStream<T>,
+    service_sender: async_channel::Sender<ControlServerMessage>,
     is_client: bool,
     state: ServiceState,
     peer_id: Option<String>,
@@ -184,12 +258,14 @@ where
 {
     pub fn new(
         websocket: &'a mut WebSocketStream<T>,
+        service_sender: async_channel::Sender<ControlServerMessage>,
         is_client: bool,
         state: ServiceState,
         peer_addr: SocketAddr,
     ) -> Self {
         Self {
             websocket,
+            service_sender,
             is_client,
             state,
             peer_id: None,
@@ -319,7 +395,7 @@ where
             }
             DecryptedMessage::AllocWormhole => {
                 if !authenticated_peer {
-                    self.send_encrypted_msg(DecryptedMessage::AuthenticationFailed)
+                    self.send_encrypted_msg(DecryptedMessage::AuthenticationResult(false))
                         .await?;
                 } else {
                     let port = self.state.read().rendezvous_port;
@@ -330,7 +406,7 @@ where
             }
             DecryptedMessage::Wormhole { port, code } => {
                 if !authenticated_peer {
-                    self.send_encrypted_msg(DecryptedMessage::AuthenticationFailed)
+                    self.send_encrypted_msg(DecryptedMessage::AuthenticationResult(true))
                         .await?;
                 } else {
                     println!(
@@ -340,10 +416,6 @@ where
                 }
             }
             DecryptedMessage::InitiateTransfer => self.authenticate_peer(self.is_client).await?,
-            DecryptedMessage::AuthenticationFailed => {
-                println!("Invalid verification message received from peer.");
-                return Err(ConnectionError::VerificationFailed);
-            }
             DecryptedMessage::Remove => {
                 // Remove the peer from all discovery lists
                 if let Some(peer_id) = &self.peer_id {
@@ -378,6 +450,8 @@ where
             self.handle_decrypted_message(&msg).await?;
         }
 
+        println!("Closing server connection");
+
         // TODO how to clean up client data?
         /*if let Some(peer_id) = &self.peer_id {
             // Remove the peer data because the connection got lost
@@ -394,10 +468,12 @@ where
         println!("authenticate_peer");
         let my_pubkey = self.state.read().device_key.public_key().to_vec();
         let Some(peer_id) = self.peer_id.clone() else {
+            println!("Peer doesn't exist in list of known peers");
             return Err(ConnectionError::InvalidState);
         };
 
         let Some(their_pubkey) = &self.state.read().peers.get(&peer_id).map(|peer| peer.public_key.clone()) else {
+            println!("No public key found");
             return Err(ConnectionError::CryptoError);
         };
 
@@ -412,25 +488,26 @@ where
                 .map_or(false, |peer| peer.authenticated)
         {
             // We already authenticated the user. Now let's see if our peer agrees
-            self.send_encrypted_msg(DecryptedMessage::AuthenticationSuccess)
+            self.send_encrypted_msg(DecryptedMessage::AuthenticationResult(true))
                 .await?;
             let msg = self.receive_encrypted_msg().await?;
             match msg {
                 DecryptedMessage::UserAuthenticate => {
                     // Fall through and go through user authentication flow
                 }
-                DecryptedMessage::AuthenticationSuccess => {
-                    // We agree that we don't need verification
-                    self.state
-                        .write()
-                        .peers
-                        .get_mut(&peer_id)
-                        .map(|peer| peer.authenticated = true);
-                    do_user_auth = false;
-                }
-                DecryptedMessage::AuthenticationFailed => {
-                    println!("Authentication failed");
-                    return Err(ConnectionError::CryptoError);
+                DecryptedMessage::AuthenticationResult(success) => {
+                    if success {
+                        // We agree that we don't need verification
+                        self.state
+                            .write()
+                            .peers
+                            .get_mut(&peer_id)
+                            .map(|peer| peer.authenticated = true);
+                        do_user_auth = false;
+                    } else {
+                        println!("Authentication failed");
+                        return Err(ConnectionError::CryptoError);
+                    }
                 }
                 _ => {
                     println!("Expected authentication message");
@@ -451,10 +528,29 @@ where
 
             // Calculate SAS
             let sas = Sas::new_hkdf_sha265(&sas_secret, &my_pubkey, their_pubkey, is_client);
-            println!("Authentication SAS emoji: {}", sas.get_emoji_string(6).1);
+            let (emoji, verbose_emoji) = sas.get_emoji_string(6);
+            println!("Authentication SAS emoji: {}", verbose_emoji);
 
-            // TODO: Emoji verification
-            self.send_encrypted_msg(DecryptedMessage::AuthenticationSuccess)
+            let (result_sender, result_receiver) = async_channel::unbounded();
+            let result_fn = move |result| {
+                result_sender.send_blocking(true).unwrap();
+            };
+
+            self.service_sender
+                .send(ControlServerMessage::CompareEmoji {
+                    peer_id: peer_id.clone(),
+                    emoji,
+                    verbose_emoji,
+                    result_fn: Box::new(result_fn),
+                })
+                .await
+                .map_err(|_| ConnectionError::InvalidState)?;
+
+            let result = result_receiver
+                .recv()
+                .await
+                .map_err(|_| ConnectionError::InvalidState)?;
+            self.send_encrypted_msg(DecryptedMessage::AuthenticationResult(result))
                 .await?;
 
             loop {
@@ -463,18 +559,27 @@ where
                     DecryptedMessage::UserAuthenticate => {
                         // They want to authenticate as well
                     }
-                    DecryptedMessage::AuthenticationSuccess => {
-                        println!("Authentication success!");
+                    DecryptedMessage::AuthenticationResult(success) => {
                         self.state
                             .write()
                             .peers
                             .get_mut(&peer_id)
-                            .map(|peer| peer.authenticated = true);
-                        break;
-                    }
-                    DecryptedMessage::AuthenticationFailed => {
-                        println!("Authentication failed");
-                        return Err(ConnectionError::CryptoError);
+                            .map(|peer| peer.authenticated = success);
+                        self.service_sender
+                            .send(ControlServerMessage::CompareEmojiPeerResult {
+                                peer_id: peer_id.clone(),
+                                result: success,
+                            })
+                            .await
+                            .map_err(|_| ConnectionError::InvalidState)?;
+
+                        if success {
+                            println!("Authentication success!");
+                            break;
+                        } else {
+                            println!("Authentication failed");
+                            return Err(ConnectionError::CryptoError);
+                        }
                     }
                     _ => {
                         println!("Expected authentication message");
@@ -673,7 +778,7 @@ where
         Ok(())
     }
 
-    pub async fn client_connection(mut self) -> Result<(), ConnectionError> {
+    pub async fn client_discovery_connection(&mut self) -> Result<(), ConnectionError> {
         println!("Client connection");
         self.handshake(true).await?;
 
@@ -683,7 +788,12 @@ where
         let msg = self.receive_encrypted_msg().await?;
         self.handle_decrypted_message(&msg).await?;
 
-        println!("Verifying peer connection");
+        Ok(())
+    }
+
+    pub async fn client_request_transfer(&mut self) -> Result<(), ConnectionError> {
+        self.handshake(true).await?;
+        println!("Authenticating peer connection");
         self.send_encrypted_msg(DecryptedMessage::InitiateTransfer)
             .await?;
         self.authenticate_peer(true).await?;

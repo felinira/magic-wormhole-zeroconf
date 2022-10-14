@@ -1,25 +1,32 @@
 use crate::control::message::PeerInfoMessage;
-use crate::control::server::{ControlServer, Peer};
+use crate::control::server::{ConnectionError, ControlServer, ControlServerMessage, Peer};
 use crate::key;
 use crate::key::device::DeviceKeyPair;
 use crate::state::ServiceState;
-use crate::zeroconf::{ZeroconfBrowser, ZeroconfEvent, ZeroconfService};
+use crate::zeroconf::{ZeroconfBrowser, ZeroconfEvent, ZeroconfService, ZeroconfServiceDiscovery};
+use async_tungstenite::tungstenite::protocol::frame::coding::OpCode::Control;
 use futures::{select, FutureExt};
-use magic_wormhole_mailbox::rendezvous_server;
+use magic_wormhole_mailbox::{rendezvous_server, RendezvousServer};
 use std::collections::HashSet;
 use std::net::AddrParseError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use sysinfo::SystemExt;
 use zeroconf::prelude::*;
 use zeroconf::ServiceDiscovery;
 
-#[derive(Clone, Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error("Internal error: {}", _0)]
     InternalError(String),
+    #[error("Connection error")]
+    ConnectionError {
+        #[from]
+        source: ConnectionError,
+    },
 }
 
 /// These messages are sent from the service to the application
-#[derive(Clone, Debug)]
 pub enum ServiceMessage {
     ServiceStarted,
     ServiceStopped,
@@ -38,6 +45,11 @@ pub enum ServiceMessage {
         peer_id: String,
         emoji: String,
         verbose_emoji: String,
+        result_fn: Box<dyn FnOnce(bool) + Send>,
+    },
+    CompareEmojiPeerResult {
+        peer_id: String,
+        result: bool,
     },
 }
 
@@ -52,34 +64,45 @@ pub enum ServiceRequest {
 pub struct Service {
     state: ServiceState,
 
-    service_callback: Box<&'static dyn Fn(ServiceMessage)>,
-
-    service_receiver: Option<async_channel::Receiver<ServiceMessage>>,
     service_sender: async_channel::Sender<ServiceMessage>,
-
     request_receiver: Option<async_channel::Receiver<ServiceRequest>>,
-    request_sender: async_channel::Sender<ServiceRequest>,
+
+    control_server_receiver: async_channel::Receiver<ControlServerMessage>,
+    control_server_sender: async_channel::Sender<ControlServerMessage>,
+
+    stop_handle: Arc<AtomicBool>,
 }
 
 impl Service {
-    pub fn new(device_key: DeviceKeyPair, callback: &'static dyn Fn(ServiceMessage) -> ()) -> Self {
+    pub fn new(
+        device_key: DeviceKeyPair,
+    ) -> (
+        async_channel::Sender<ServiceRequest>,
+        async_channel::Receiver<ServiceMessage>,
+        Self,
+    ) {
         let my_id = uuid::Uuid::new_v4();
         let my_info = Self::system_peer_info(my_id.to_string());
 
         let (service_sender, service_receiver) = async_channel::unbounded();
         let (request_sender, request_receiver) = async_channel::unbounded();
+        let (control_server_sender, control_server_receiver) = async_channel::unbounded();
         let state = ServiceState::new(my_info, device_key, service_sender.clone());
 
-        Self {
-            state,
-
-            service_callback: Box::new(callback),
-
-            service_receiver: Some(service_receiver),
-            service_sender,
-            request_receiver: Some(request_receiver),
+        (
             request_sender,
-        }
+            service_receiver,
+            Self {
+                state,
+
+                service_sender,
+                request_receiver: Some(request_receiver),
+                control_server_receiver,
+                control_server_sender,
+
+                stop_handle: Arc::default(),
+            },
+        )
     }
 
     fn system_peer_info(my_id: String) -> PeerInfoMessage {
@@ -95,10 +118,10 @@ impl Service {
 
     async fn handle_service_discovered(
         &self,
-        discovery: &ServiceDiscovery,
+        discovery: &ZeroconfServiceDiscovery,
     ) -> Result<(), ServiceError> {
         let my_id = &self.state.read().my_info.service_uuid.clone();
-        let txt = match &discovery.txt() {
+        let txt = match &discovery.txt {
             None => return Ok(()),
             Some(txt) => txt,
         };
@@ -108,28 +131,33 @@ impl Service {
             return Ok(());
         };
 
-        if &peer_id == my_id {
+        if peer_id == my_id {
             println!("Discovered myself");
             return Ok(());
         }
 
-        let control_port = discovery.port();
+        let control_port = discovery.port;
 
         // Connect to the control port
-        let socket_addr = if discovery.address().contains(":") {
+        let socket_addr = if discovery.address.contains(":") {
             // This is an IPv6 address
             // TODO: Is there a better way?
-            format!("[{}]:{}", discovery.address(), control_port)
+            format!("[{}]:{}", discovery.address, control_port)
                 .parse()
                 .map_err(|err: AddrParseError| ServiceError::InternalError(err.to_string()))?
         } else {
-            format!("{}:{}", discovery.address(), control_port)
+            format!("{}:{}", discovery.address, control_port)
                 .parse()
                 .map_err(|err: AddrParseError| ServiceError::InternalError(err.to_string()))?
         };
 
         // Run connection in the background
-        ControlServer::connect_to_peer(self.state.clone(), socket_addr).await;
+        ControlServer::peer_discovery_client(
+            self.state.clone(),
+            self.control_server_sender.clone(),
+            socket_addr,
+        )
+        .await;
 
         Ok(())
     }
@@ -143,16 +171,80 @@ impl Service {
         Ok(())
     }
 
-    pub async fn handle_request(&mut self, request: ServiceRequest) {
+    async fn initiate_transfer(&self, peer_id: &str) -> Result<(), ServiceError> {
+        ControlServer::initiate_transfer(
+            self.state.clone(),
+            peer_id.to_string(),
+            self.control_server_sender.clone(),
+        )?;
+        Ok(())
+    }
+
+    async fn handle_request(&mut self, request: &ServiceRequest) -> Result<(), ServiceError> {
         match request {
-            ServiceRequest::InitiateTransfer { peer_id } => {}
-            ServiceRequest::SetAuthorizedKeys(keys) => {}
-            ServiceRequest::StopService => {}
+            ServiceRequest::InitiateTransfer { peer_id } => {
+                self.initiate_transfer(peer_id).await?;
+            }
+            ServiceRequest::SetAuthorizedKeys(keys) => {
+                // We need all locks
+                let handshake_lock = crate::control::server::HANDSHAKE_LOCK.lock().await;
+                let mut state_lock = self.state.write();
+
+                state_lock.authorized_keys = keys.clone();
+                for peer in state_lock.peers.values_mut() {
+                    // Unauthenticate peer if not in the list anymore
+                    let pubkey = &peer.public_key;
+                    if !keys.contains(pubkey) {
+                        peer.authenticated = false;
+                    }
+                }
+
+                drop(handshake_lock);
+                drop(state_lock);
+            }
+            ServiceRequest::StopService => {
+                self.stop_handle.store(true, Ordering::Relaxed)
+                // This will return and the run loop will exit
+            }
         }
+
+        Ok(())
+    }
+
+    async fn handle_control_server_msg(
+        &mut self,
+        msg: ControlServerMessage,
+    ) -> Result<(), ServiceError> {
+        match msg {
+            ControlServerMessage::CompareEmoji {
+                peer_id,
+                emoji,
+                verbose_emoji,
+                result_fn,
+            } => {
+                self.service_sender
+                    .send(ServiceMessage::CompareEmoji {
+                        peer_id,
+                        emoji,
+                        verbose_emoji,
+                        result_fn,
+                    })
+                    .await
+                    .map_err(|_| ServiceError::InternalError("Channel closed".to_string()))?;
+            }
+            ControlServerMessage::CompareEmojiPeerResult { peer_id, result } => {
+                self.service_sender
+                    .send(ServiceMessage::CompareEmojiPeerResult { peer_id, result })
+                    .await
+                    .map_err(|_| ServiceError::InternalError("Channel closed".to_string()))?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn run(&mut self) -> Result<(), ServiceError> {
-        let mut rendezvous_server = rendezvous_server::RendezvousServer::run(0).await.unwrap();
+        let mut rendezvous_server = RendezvousServer::run(0).await.unwrap();
         println!(
             "Rendezvous: Listening on port: {}",
             rendezvous_server.port()
@@ -166,19 +258,15 @@ impl Service {
         println!("Control: Listening on port: {}", control_server.port());
 
         let (zeroconf_sender, zeroconf_receiver) = async_channel::unbounded();
-        let service = ZeroconfService::run(control_server.port(), my_id, zeroconf_sender.clone());
-        let browser = ZeroconfBrowser::run(zeroconf_sender);
-
+        let mut zeroconf_service =
+            ZeroconfService::spawn(control_server.port(), my_id, zeroconf_sender.clone());
+        let mut zeroconf_browser = ZeroconfBrowser::spawn(zeroconf_sender);
         let request_receiver = self.request_receiver.take().unwrap();
 
-        loop {
+        while !self.stop_handle.load(Ordering::Relaxed) {
             println!("Listening for events");
-            let mut rendezvous = Box::pin(rendezvous_server.wait_for_connection()).fuse();
-            let mut control = Box::pin(control_server.wait_for_connection()).fuse();
-            let mut request = Box::pin(request_receiver.recv()).fuse();
-
             select! {
-                msg = zeroconf_receiver.recv().fuse() => if let Ok(msg) = &msg {
+                msg_res = zeroconf_receiver.recv().fuse() => if let Ok(msg) = &msg_res {
                     match msg {
                         ZeroconfEvent::ServiceDiscovered(discovery) => {
                             println!("Service discovered event");
@@ -192,16 +280,25 @@ impl Service {
                         }
                     }
                 },
-                msg_res = request => match msg_res {
-                    Ok(msg) => {
-                    },
-                    Err(err) => {
-
-                    }
+                msg_res = Box::pin(request_receiver.recv()).fuse() => if let Ok(msg) = &msg_res {
+                    self.handle_request(msg).await?;
                 },
-                () = rendezvous => println!("Rendezvous server stopped"),
-                () = control => println!("Control server stopped"),
+                () = Box::pin(rendezvous_server.wait_for_connection()).fuse() =>
+                    println!("Rendezvous server stopped"),
+                () = Box::pin(control_server.wait_for_connection(self.control_server_sender.clone())).fuse() =>
+                    println!("Control server stopped"),
+                msg_res = self.control_server_receiver.recv().fuse() => if let Ok(msg) = msg_res {
+                    self.handle_control_server_msg(msg).await?;
+                }
             }
         }
+
+        // Stop everything
+        zeroconf_service.runner.stop();
+        zeroconf_browser.runner.stop();
+        control_server.stop().await;
+        rendezvous_server.stop().await;
+
+        Ok(())
     }
 }

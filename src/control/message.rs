@@ -40,8 +40,7 @@ pub enum DecryptedMessage {
     AllocWormhole,
     InitiateTransfer,
     UserAuthenticate,
-    AuthenticationSuccess,
-    AuthenticationFailed,
+    AuthenticationResult(bool),
     Wormhole {
         port: u16,
         code: String,

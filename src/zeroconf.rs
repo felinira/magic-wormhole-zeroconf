@@ -1,6 +1,7 @@
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::Thread;
 use std::time;
 use std::time::Duration;
 use zeroconf::prelude::*;
@@ -14,11 +15,46 @@ const SERVICE_NAME: &'static str = "app-drey-Warp-zeroconf-v0";
 pub(crate) enum ZeroconfEvent {
     Error(zeroconf::error::Error),
     ServiceRegistered,
-    ServiceDiscovered(ServiceDiscovery),
+    ServiceDiscovered(ZeroconfServiceDiscovery),
+}
+
+/// ServiceDiscovery is not Sync
+#[derive(Debug)]
+pub struct ZeroconfServiceDiscovery {
+    pub name: String,
+    pub service_type: ServiceType,
+    pub domain: String,
+    pub host_name: String,
+    pub address: String,
+    pub port: u16,
+    pub txt: Option<HashMap<String, String>>,
+}
+
+impl From<ServiceDiscovery> for ZeroconfServiceDiscovery {
+    fn from(discovery: ServiceDiscovery) -> Self {
+        let txt = discovery.txt().as_ref().map(|txt| txt.iter().collect());
+
+        Self {
+            name: discovery.name().clone(),
+            service_type: discovery.service_type().clone(),
+            domain: discovery.domain().clone(),
+            host_name: discovery.host_name().clone(),
+            address: discovery.address().clone(),
+            port: *discovery.port(),
+            txt,
+        }
+    }
 }
 
 pub(crate) struct ZeroconfRunner {
-    pub thread: std::thread::JoinHandle<Thread>,
+    thread: std::thread::JoinHandle<()>,
+    stop_handle: Arc<AtomicBool>,
+}
+
+impl ZeroconfRunner {
+    pub fn stop(self) {
+        self.stop_handle.store(true, Ordering::Relaxed);
+    }
 }
 
 pub(crate) struct ZeroconfService {
@@ -26,12 +62,14 @@ pub(crate) struct ZeroconfService {
 }
 
 impl ZeroconfService {
-    pub fn run(
+    pub fn spawn(
         control_port: u16,
         service_uuid: String,
         sender: async_channel::Sender<ZeroconfEvent>,
     ) -> Self {
         println!("Running service");
+        let stop_handle: Arc<AtomicBool> = Arc::default();
+        let stop_handle_thread = stop_handle.clone();
         let thread = std::thread::spawn(move || {
             let mut service =
                 MdnsService::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap(), control_port);
@@ -45,14 +83,17 @@ impl ZeroconfService {
 
             let event_loop = service.register().unwrap();
 
-            loop {
-                std::thread::sleep(time::Duration::from_secs(1));
-                event_loop.poll(Duration::from_secs(0)).unwrap();
+            while !stop_handle_thread.load(Ordering::Relaxed) {
+                event_loop.poll(Duration::from_secs(2)).unwrap();
+                std::thread::sleep(time::Duration::from_millis(500));
             }
         });
 
         Self {
-            runner: ZeroconfRunner { thread },
+            runner: ZeroconfRunner {
+                thread,
+                stop_handle,
+            },
         }
     }
 
@@ -78,8 +119,6 @@ impl ZeroconfService {
             }
         }
     }
-
-    pub fn stop(&mut self) {}
 }
 
 pub(crate) struct ZeroconfBrowser {
@@ -87,22 +126,27 @@ pub(crate) struct ZeroconfBrowser {
 }
 
 impl ZeroconfBrowser {
-    pub fn run(sender: async_channel::Sender<ZeroconfEvent>) -> Self {
+    pub fn spawn(sender: async_channel::Sender<ZeroconfEvent>) -> Self {
         println!("Running listener");
-        let thread = std::thread::spawn(|| {
+        let stop_handle: Arc<AtomicBool> = Arc::default();
+        let stop_handle_thread = stop_handle.clone();
+        let thread = std::thread::spawn(move || {
             let mut browser = MdnsBrowser::new(ServiceType::new(SERVICE_NAME, "tcp").unwrap());
             browser.set_service_discovered_callback(Box::new(Self::on_service_discovered));
             browser.set_context(Box::new(sender));
             let event_loop = browser.browse_services().unwrap();
 
-            loop {
-                std::thread::sleep(time::Duration::from_secs(1));
-                event_loop.poll(Duration::from_secs(0)).unwrap();
+            while !stop_handle_thread.load(Ordering::Relaxed) {
+                event_loop.poll(Duration::from_secs(2)).unwrap();
+                std::thread::sleep(time::Duration::from_millis(500));
             }
         });
 
         Self {
-            runner: ZeroconfRunner { thread },
+            runner: ZeroconfRunner {
+                thread,
+                stop_handle,
+            },
         }
     }
 
@@ -137,7 +181,7 @@ impl ZeroconfBrowser {
                 */
                 println!("Service discovered: {:?}", service);
                 sender
-                    .send_blocking(ZeroconfEvent::ServiceDiscovered(service))
+                    .send_blocking(ZeroconfEvent::ServiceDiscovered(service.into()))
                     .unwrap();
             }
             Err(err) => {
